@@ -67,10 +67,10 @@ class PointcloudPreprocessorNode(Node):
         self.declare_parameter('static_camera_to_robot_tf', True)
         self.declare_parameter('transform_timeout', 0.1)
 
-        self.declare_parameter('crop_to_roi', False)
-        self.declare_parameter('roi_min', [-3.0, -3.0, -2.0])
-        self.declare_parameter('roi_max', [3.0, 3.0, 2.0])
-        self.declare_parameter('voxel_size', 0.0)  # 0.01
+        self.declare_parameter('crop_to_roi', True)
+        self.declare_parameter('roi_min', [-6.0, -6.0, -0.05])
+        self.declare_parameter('roi_max', [6.0, 6.0, 2.0])
+        self.declare_parameter('voxel_size', 0.01)  # 0.01
         self.declare_parameter('remove_statistical_outliers', False)
         self.declare_parameter('estimate_normals', False)
         self.declare_parameter('remove_ground', False)
@@ -222,6 +222,18 @@ class PointcloudPreprocessorNode(Node):
                 self.o3d_pointcloud = self.o3d_pointcloud.transform(self.camera_to_robot_tf)
                 frame_id = self.robot_frame
                 self.processing_times['transform'] = time.time() - start_time
+
+                # # Remove duplicate points. todo: test
+                # start_time = time.time()
+                # mask = self.o3d_pointcloud.remove_duplicate_points()
+                # self.o3d_pointcloud = self.o3d_pointcloud.select_by_mask(mask)
+                # self.processing_times['remove_duplicate_points'] = time.time() - start_time
+
+                # # Remove NaN points. todo: test
+                # start_time = time.time()
+                # self.o3d_pointcloud = self.o3d_pointcloud.remove_non_finite_points(remove_nan=True,
+                #                                                                    remove_infinite=True)
+                self.processing_times['remove_nan_points'] = time.time() - start_time
 
             # ROI cropping
             if self.crop_to_roi:
