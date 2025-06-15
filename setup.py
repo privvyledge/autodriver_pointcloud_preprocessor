@@ -63,6 +63,7 @@ setup(
         entry_points={
             'console_scripts': [
                 'pointcloud_preprocessor = autodriver_pointcloud_preprocessor.pointcloud_preprocessor:main',
+                'pointcloud_compressor = autodriver_pointcloud_preprocessor.pointcloud_compressor:main'
             ],
         },
 )
