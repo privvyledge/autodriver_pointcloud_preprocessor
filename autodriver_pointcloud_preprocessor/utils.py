@@ -128,8 +128,7 @@ def dict_to_open3d_tensor_pointcloud(pointcloud_dict, device="CPU:0"):
     return pointcloud
 
 
-def numpy_struct_to_pointcloud2(points: np.ndarray,
-                                field_names: list,
+def numpy_struct_to_pointcloud2(field_names: list,
                                 field_datatypes: list, is_dense: bool = True) -> tuple[list[Any], int | Any]:
     """
         Convert a NumPy structured (or regular) array back into a sensor_msgs/PointCloud2.
@@ -154,26 +153,26 @@ def numpy_struct_to_pointcloud2(points: np.ndarray,
         fields.append(pf)
         offset += byte_size
 
-    # Now flatten the data into a single contiguous buffer
-    # If points is structured dtype, we can view it as raw bytes per record:
-    if isinstance(points.dtype, np.dtype) and points.dtype.names is not None:
-        # Ensure the fields in points.dtype.names exactly match field_names
-        # (up to ordering). We'll reorder/cast if necessary.
-        reorder_needed = list(points.dtype.names) != field_names
-        if reorder_needed:
-            # Create a new array with exactly field_names order
-            new_arr = np.zeros(points.shape, dtype=np.dtype([(n, points.dtype.fields[n][0]) for n in field_names]))
-            for n in field_names:
-                new_arr[n] = points[n]
-            points = new_arr
-
-        # Now raw bytes:
-        data_bytes = points.tobytes(order="C")
-
-    else:
-        # If points is a (N, M) float32/float64 array or something:
-        # We assume that the user knows to pass the correct flat array form.
-        data_bytes = points.tobytes(order="C")
+    # # Now flatten the data into a single contiguous buffer
+    # # If points is structured dtype, we can view it as raw bytes per record:
+    # if isinstance(points.dtype, np.dtype) and points.dtype.names is not None:
+    #     # Ensure the fields in points.dtype.names exactly match field_names
+    #     # (up to ordering). We'll reorder/cast if necessary.
+    #     reorder_needed = list(points.dtype.names) != field_names
+    #     if reorder_needed:
+    #         # Create a new array with exactly field_names order
+    #         new_arr = np.zeros(points.shape, dtype=np.dtype([(n, points.dtype.fields[n][0]) for n in field_names]))
+    #         for n in field_names:
+    #             new_arr[n] = points[n]
+    #         points = new_arr
+    #
+    #     # Now raw bytes:
+    #     data_bytes = points.tobytes(order="C")
+    #
+    # else:
+    #     # If points is a (N, M) float32/float64 array or something:
+    #     # We assume that the user knows to pass the correct flat array form.
+    #     data_bytes = points.tobytes(order="C")
 
     # # Fill in PointCloud2 fields
     # width = points.shape[0]
@@ -208,7 +207,7 @@ def pointcloud_to_dict(ros_cloud, field_names=None, skip_nans=True, organize_clo
 
 
 def check_field(field, pointcloud_dict, metadata_dict):
-    if pointcloud_dict.get(field, None) is not None or metadata_dict[f'has_{field}']:
+    if pointcloud_dict.get(field, None) is not None or metadata_dict.get(f'has_{field}', None):
         return True
     return False
 
@@ -239,11 +238,11 @@ def crop_pointcloud(pointcloud, backend='open3d', min_bound=None, max_bound=None
         points = pointcloud.point.positions  # pointcloud.point.positions.cpu().numpy()
         # optional: transfer to cpu then numpy first
         if not points.is_cpu:
-            msg = f'{msg}. Transferring points to cpu...'
+            msg = f'{msg} Transferring points to cpu...'
             points = points.cpu()
 
         if not isinstance(points, np.ndarray):
-            msg = f'{msg}. Converting points to numpy...'
+            msg = f'{msg} Converting points to numpy...'
             points = points.numpy()
 
         # use numpy operations since they can be significantly faster than Open3D on CPU
@@ -281,7 +280,7 @@ def crop_pointcloud(pointcloud, backend='open3d', min_bound=None, max_bound=None
         pointcloud = pointcloud.select_by_mask(crop_mask)
     else:
         pointcloud = pointcloud.crop(aabb, invert=invert)
-        msg = f'{msg}. Using Open3D pointcloud.crop()'
+        msg = f'{msg} Using Open3D pointcloud.crop()'
     return pointcloud, msg
 
 
@@ -445,11 +444,11 @@ def remove_duplicates(pointcloud, backend='torch'):
         points = pointcloud.point.positions  # pointcloud.point.positions.cpu().numpy()
         # optional: transfer to cpu then numpy first
         if not points.is_cpu:
-            msg = f'{msg}. Transferring points to cpu...'
+            msg = f'{msg} Transferring points to cpu...'
             points = points.cpu()
 
         if not isinstance(points, np.ndarray):
-            msg = f'{msg}. Converting points to numpy...'
+            msg = f'{msg} Converting points to numpy...'
             points = points.numpy()
 
         # use numpy operations since they can be significantly faster than Open3D on CPU
@@ -467,5 +466,5 @@ def remove_duplicates(pointcloud, backend='torch'):
     else:
         pointcloud, duplicates_mask = pointcloud.remove_duplicated_points()
         # pointcloud = pointcloud.select_by_mask(duplicates_mask)
-        msg = f'{msg}. Using Open3D pointcloud.remove_duplicated_points()'
+        msg = f'{msg} Using Open3D pointcloud.remove_duplicated_points()'
     return pointcloud, msg

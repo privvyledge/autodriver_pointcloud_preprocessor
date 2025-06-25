@@ -21,29 +21,33 @@ Todo:
     * move duplicate removal to a function in utils [done]
     * Move transformation, pointcloud msg parsing (to/from), conversion to/from Open3D tensors to  utils file [done]
     * Move preprocessing to a separate function for reusing in different nodes. [done]
-    * optimize ROS <--> Open3D extraction, i.e PointCloud from dictonary (and test with GPU) [done]
-    * use "partial" from functools and initialize the timing dict once
-    * optionally publish processing times as a ROS message
-    * test pointcloud transformation to different frames
+    * optimize ROS <--> Open3D extraction, i.e PointCloud from dictionary (and test with GPU) [done]
+    * Add parameters for all preprocessing functions and make them modular to be used in composable nodes [done]
+    * use "partial" from functools [done]
+    * initialize the timing dict once then print if debug
+    * add numpy and torch based nan and infinite point removal (https://github.com/SeungBack/open3d-ros-helper/blob/master/open3d_ros_helper/open3d_ros_helper.py#L262)
+    * replace infinite/nan removal with numpy and torch native operations
+    * Compare my cropping function with (https://github.com/SeungBack/open3d-ros-helper/blob/master/open3d_ros_helper/open3d_ros_helper.py#L385)
+    * test pointcloud transformation to different frames (do this with the US DOT dataset)
     * add other preprocessing steps such as furthest point downsampling, uniform downsampling, random downsampling, radius outlier removal, etc.
         * See https://www.open3d.org/docs/release/python_api/open3d.t.geometry.PointCloud.html
-    * if estimate_normals is True, also publish a marker of normals (could also be done in a separate thread or by another node)
-    * create fpfh feature estimation node https://www.open3d.org/docs/latest/python_api/open3d.t.pipelines.registration.compute_fpfh_feature.html
     * add good defaults for all parameters, e.g n * voxel_size. See Open3D documentation for more details.
+    * if estimate_normals is True, also publish a marker of normals (could also be done in a separate thread or by another node)
     * finalize ROS <--> Numpy conversion by comparing to other git repos
+    * Create a class for processing pointclouds to and from Open3D tensors (https://github.com/ros2/common_interfaces/blob/humble/sensor_msgs_py/sensor_msgs_py/point_cloud2.py | https://gist.github.com/SebastianGrans/6ae5cab66e453a14a859b66cd9579239)
+    * Create torch version of unpacking pointclouds (https://github.com/ros2/common_interfaces/blob/humble/sensor_msgs_py/sensor_msgs_py/point_cloud2.py | https://gist.github.com/SebastianGrans/6ae5cab66e453a14a859b66cd9579239)
+        * Use tensordict to copy to torch tensors at once instead of Open3D tensors then use dlpack to transfer ownership of each tensor (https://github.com/pytorch/tensordict/blob/main/GETTING_STARTED.md | https://github.com/pytorch/tensordict)
+        * Compare Torch tensordicts to open3d tensors
     * Optimize different names/fields from different vendors and unify in a dictionary
-    * replace infinite/nan removal with numpy and torch native operations
     * add onetime height/ground estimation from my autodriving transformer code
     * Create a Python "package" for standalone non-ROS use then just import that here
     * make torch an optional dependency, i.e. only use it if the user has it installed. Device checks for Open3D do not need torch.
-    * Add parameters for all preprocessing functions and make them modular to be used in composable nodes
     * Remove Todo comments and add to package description/features
 """
 import os
 import sys
 import pathlib  # avoid importing Path to avoid clashes with nav2_msgs/msg/Path.py
-
-from utils import check_field, crop_pointcloud
+from functools import partial
 
 import time
 import struct
@@ -78,10 +82,12 @@ import torch.utils.dlpack
 import open3d as o3d
 import open3d.core as o3c
 
+# from utils import ...
 from autodriver_pointcloud_preprocessor.utils import (convert_pointcloud_to_numpy, numpy_struct_to_pointcloud2,
                                                       get_current_time, get_time_difference,
                                                       dict_to_open3d_tensor_pointcloud,
                                                       pointcloud_to_dict, get_pointcloud_metadata,
+                                                      check_field, crop_pointcloud,
                                                       extract_rgb_from_pointcloud, get_fields_from_dicts,
                                                       remove_duplicates, rgb_int_to_float,
                                                       FIELD_DTYPE_MAP, FIELD_DTYPE_MAP_INV)
@@ -89,8 +95,8 @@ from autodriver_pointcloud_preprocessor.utils import (convert_pointcloud_to_nump
 
 
 class PointcloudPreprocessorNode(Node):
-    def __init__(self):
-        super(PointcloudPreprocessorNode, self).__init__('pointcloud_preprocessor')
+    def __init__(self, node_name='pointcloud_preprocessor', enabled=True):
+        super(PointcloudPreprocessorNode, self).__init__(node_name)
 
         # Declare parameters
         self.declare_parameter(name='input_topic', value="/velodyne_front/velodyne_points",  # /camera/camera/depth/color/points, /lidar1/velodyne_points , /velodyne_front/velodyne_points,
@@ -248,7 +254,11 @@ class PointcloudPreprocessorNode(Node):
             max_bound = o3c.Tensor(self.roi_max, dtype=o3c.Dtype.Float32)
             self.crop_aabb = o3d.t.geometry.AxisAlignedBoundingBox(min_bound, max_bound).to(self.o3d_device)
 
+        self.passthrough_filter = partial(crop_pointcloud, min_bound=self.roi_min, max_bound=self.roi_max,
+                                         invert=self.crop_to_roi_invert, aabb=self.crop_aabb)
         self.pointcloud_metadata = None
+        self.pointfields, self.point_offset, self.new_dtype = None, None, None  # pointcloud fields and offset for numpy struct
+        self.reset_fields = False
 
         # Debugging parameters
         self.processing_times = {}
@@ -298,21 +308,91 @@ class PointcloudPreprocessorNode(Node):
             # self.vis.get_render_option().point_size = 2
             self.vis.add_geometry(self.o3d_pointcloud.to_legacy())
 
-        # Setup dynamic parameter reconfiguring.
-        # Register a callback function that will be called whenever there is an attempt to
-        # change one or more parameters of the node.
-        self.add_on_set_parameters_callback(self.parameter_change_callback)
-
         # Setup subscribers
-        self.poincloud_sub = self.create_subscription(PointCloud2, self.input_topic,
-                                                      self.callback, qos_profile=qos_profile)
+        if enabled:
+            # Setup dynamic parameter reconfiguring.
+            # Register a callback function that will be called whenever there is an attempt to
+            # change one or more parameters of the node.
+            self.add_on_set_parameters_callback(self.parameter_change_callback)
+            self.poincloud_sub = self.create_subscription(PointCloud2, self.input_topic,
+                                                          self.callback, qos_profile=qos_profile)
 
-        # Setup publishers
-        self.pointcloud_pub = self.create_publisher(PointCloud2, self.output_topic, self.queue_size)
+            # Setup publishers
+            self.pointcloud_pub = self.create_publisher(PointCloud2, self.output_topic, self.queue_size)
 
-        # self.pointcloud_timer = self.create_timer(1 / self.odom_rate, self.rgbd_timer_callback)
-        self.get_logger().info(f"{self.get_fully_qualified_name()} node started on device: {self.o3d_device}")
+            # self.pointcloud_timer = self.create_timer(1 / self.odom_rate, self.rgbd_timer_callback)
+            self.get_logger().info(f"{self.get_fully_qualified_name()} node started on device: {self.o3d_device}")
 
+
+    def extract_pointcloud(self, ros_cloud):
+        try:
+            start_time = get_current_time(monotonic=True)
+            field_names = self.pointcloud_fields if self.pointcloud_fields else None  # ('x', 'y', 'z', 'rgb'),
+            self.pointcloud_dictionary, pointcloud_metadata = pointcloud_to_dict(
+                    ros_cloud, field_names, self.remove_nans, self.organize_cloud)
+
+            if self.pointcloud_metadata is None:
+                # Optional: Extract additional attributes if present
+                self.pointcloud_metadata = get_pointcloud_metadata(pointcloud_metadata['field_names'])
+
+            self.pointcloud_metadata.update(pointcloud_metadata)
+            cloud_field_names = self.pointcloud_metadata.get('field_names', None)
+            num_fields = self.pointcloud_metadata['num_fields']
+
+        except Exception as e:
+            self.get_logger().error(f"Failed to convert PointCloud2 message to numpy: {str(e)}")
+            return None
+
+        if self.pointcloud_dictionary['cloud_array'].size == 0:
+            self.get_logger().warn("Received an empty PointCloud. Skipping...")
+            return None
+
+        self.pointcloud_dictionary.pop('cloud_array')
+
+        # test if x, y, and z are present
+        if not {"x", "y", "z"}.issubset(cloud_field_names):
+            self.get_logger().error("Incoming PointCloud does not have x, y, z fields.")
+            return None
+
+        self.processing_times['ros_to_numpy'] = get_time_difference(start_time, get_current_time(monotonic=True))
+
+        # Extract XYZ points
+        start_time = get_current_time(monotonic=True)
+
+        # Extract and convert RGB values
+        if 'rgb' in cloud_field_names and self.pointcloud_metadata['has_rgb']:
+            rgb_arr = extract_rgb_from_pointcloud(self.pointcloud_dictionary['rgb'])
+        else:
+            rgb_arr = None
+
+        self.processing_times['data_preparation'] = get_time_difference(start_time, get_current_time(monotonic=True))
+
+        # Clear previous point and attributes
+        start_time = get_current_time(monotonic=True)
+        self.o3d_pointcloud.clear()  # todo: maybe also delete non-header keys from the dictionary
+        self.processing_times['point_clearing'] = get_time_difference(start_time, get_current_time(monotonic=True))
+
+        # Convert numpy arrays to tensors and move to device. We
+        start_time = get_current_time(monotonic=True)
+        self.pointcloud_dictionary['positions'] = o3c.Tensor.from_numpy(self.pointcloud_dictionary['positions'])
+
+        if rgb_arr is not None:
+            rgb_f = rgb_arr.astype(np.float32) / 255.0
+            if check_field('rgb'):
+                self.pointcloud_dictionary['rgb'] = o3c.Tensor.from_numpy(rgb_f)
+
+        self.pointcloud_dictionary = get_fields_from_dicts('intensity', self.pointcloud_dictionary,
+                                                           self.pointcloud_metadata)
+        self.pointcloud_dictionary = get_fields_from_dicts('ring', self.pointcloud_dictionary,
+                                                           self.pointcloud_metadata)
+        self.pointcloud_dictionary = get_fields_from_dicts('time', self.pointcloud_dictionary,
+                                                           self.pointcloud_metadata)
+        self.pointcloud_dictionary = get_fields_from_dicts('return_type', self.pointcloud_dictionary,
+                                                           self.pointcloud_metadata)
+
+        self.o3d_pointcloud = dict_to_open3d_tensor_pointcloud(self.pointcloud_dictionary, device=self.o3d_device)
+        self.processing_times['tensor_transfer'] = get_time_difference(start_time, get_current_time(monotonic=True))
+        return None
 
     def preprocess(self):
         # Remove duplicate points.
@@ -328,7 +408,7 @@ class PointcloudPreprocessorNode(Node):
                 self.get_logger().info('No valid device/backend found. Using torch for duplicate removal.')
                 self.o3d_pointcloud, dupl_msg = remove_duplicates(self.o3d_pointcloud, 'torch')
 
-            self.get_logger().info(dupl_msg)
+            # self.get_logger().info(dupl_msg)
             self.processing_times['remove_duplicate_points'] = get_time_difference(start_time, get_current_time(monotonic=True))
 
         # Remove NaN points.
@@ -355,23 +435,16 @@ class PointcloudPreprocessorNode(Node):
         # ROI cropping
         if self.crop_to_roi:
             start_time = get_current_time(monotonic=True)
-            # todo: create partial function to reduce min/max bound, invert and aabb
             if 'cpu' in str(self.o3d_device).lower():
-                self.o3d_pointcloud, crop_msg = crop_pointcloud(self.o3d_pointcloud, backend=self.cpu_backend,
-                                                                min_bound=self.roi_min, max_bound=self.roi_max,
-                                                                invert=self.crop_to_roi_invert, aabb=self.crop_aabb)
+                self.o3d_pointcloud, crop_msg = self.passthrough_filter(self.o3d_pointcloud, backend=self.cpu_backend)
 
             elif 'cuda' in str(self.o3d_device).lower() or 'gpu' in str(self.o3d_device).lower():
-                self.o3d_pointcloud, crop_msg = crop_pointcloud(self.o3d_pointcloud, backend=self.gpu_backend,
-                                                                min_bound=self.roi_min, max_bound=self.roi_max,
-                                                                invert=self.crop_to_roi_invert, aabb=self.crop_aabb)
+                self.o3d_pointcloud, crop_msg = self.passthrough_filter(self.o3d_pointcloud, backend=self.gpu_backend)
 
             else:
                 self.get_logger().info('No valid device/backend found. Using open3d backend for pointcloud cropping.')
-                self.o3d_pointcloud, crop_msg = crop_pointcloud(self.o3d_pointcloud, backend='open3d',
-                                                                min_bound=self.roi_min, max_bound=self.roi_max,
-                                                                invert=self.crop_to_roi_invert, aabb=self.crop_aabb)
-            self.get_logger().info(crop_msg)
+                self.o3d_pointcloud, crop_msg = crop_pointcloud(self.o3d_pointcloud, backend='open3d')
+            # self.get_logger().info(crop_msg)
             self.processing_times['crop'] = get_time_difference(start_time, get_current_time(monotonic=True))
 
         # Voxel downsampling
@@ -412,6 +485,85 @@ class PointcloudPreprocessorNode(Node):
             self.processing_times['ground_segmentation'] = get_time_difference(start_time, get_current_time(monotonic=True))
         return self.o3d_pointcloud
 
+    def set_fields(self, ros_cloud):
+        # this field name and type extraction should be done once since it is most likely static unless a parameter (e.g fields) is updated or the pointcloud type changes which is unlikely
+        orig_field_names = []
+        orig_field_types = []
+
+        for f in ros_cloud.fields:
+            orig_field_names.append(f.name)
+            orig_field_types.append(f.datatype)
+
+        self.new_dtype = []
+        for name, datatype in zip(orig_field_names, orig_field_types):
+            np_type = FIELD_DTYPE_MAP[datatype]
+            self.new_dtype.append((name, np_type))
+
+        if self.estimate_normals:
+            orig_field_names.extend(['normal_x', 'normal_y', 'normal_z'])
+            orig_field_types.extend([PointField.FLOAT32, PointField.FLOAT32, PointField.FLOAT32])
+            self.new_dtype.extend([
+                ('normal_x', FIELD_DTYPE_MAP[PointField.FLOAT32]),
+                ('normal_y', FIELD_DTYPE_MAP[PointField.FLOAT32]),
+                ('normal_z', FIELD_DTYPE_MAP[PointField.FLOAT32])
+            ])
+
+        self.pointfields, self.point_offset = numpy_struct_to_pointcloud2(
+                # processed_struct,
+                field_names=orig_field_names,
+                field_datatypes=orig_field_types,
+                is_dense=self.remove_nans and self.remove_infs
+        )
+
+    def prepare_pointcloud(self, ros_cloud):
+        processed_positions = self.o3d_pointcloud.point.positions.cpu().numpy()
+        num_points = processed_positions.shape[0]
+        if self.pointfields is None or self.reset_fields:
+            self.set_fields(ros_cloud)
+
+        processed_struct = np.zeros(num_points, dtype=self.new_dtype)
+        processed_struct["x"] = processed_positions[:, 0]
+        processed_struct["y"] = processed_positions[:, 1]
+        processed_struct["z"] = processed_positions[:, 2]
+
+        # Handle other fields.
+        rgb_np = self.copy_fields('rgb', self.o3d_pointcloud)
+        if rgb_np:
+            rgb_float32 = rgb_int_to_float(rgb_np)
+            processed_struct["rgb"] = rgb_float32
+
+        if check_field('intensity', self.pointcloud_dictionary, self.pointcloud_metadata):
+            intensity_np = self.copy_fields('intensity', self.o3d_pointcloud)
+            processed_struct["intensity"] = intensity_np.astype(processed_struct["intensity"].dtype)
+
+        if check_field('ring', self.pointcloud_dictionary, self.pointcloud_metadata):
+            ring_np = self.copy_fields('ring', self.o3d_pointcloud)
+            processed_struct["ring"] = ring_np.astype(processed_struct["ring"].dtype)
+
+        if check_field('time', self.pointcloud_dictionary, self.pointcloud_metadata):
+            time_np = self.copy_fields('time', self.o3d_pointcloud)
+            processed_struct["time"] = time_np.astype(processed_struct["time"].dtype)
+
+        if self.estimate_normals or self.pointcloud_metadata.get('has_normals', False):
+            normals_np = self.o3d_pointcloud.point.normals.cpu().numpy()
+            processed_struct["normal_x"] = normals_np[:, 0].astype(processed_struct["normal_x"].dtype)  # normal_* or n*
+            processed_struct["normal_y"] = normals_np[:, 1].astype(processed_struct["normal_y"].dtype)  # normal_* or n*
+            processed_struct["normal_z"] = normals_np[:, 2].astype(processed_struct["normal_z"].dtype)  # normal_* or n*
+        return processed_struct
+
+
+    def create_header(self, ros_cloud):
+        new_header = ros_cloud.header
+        if self.override_header:
+            if self.new_header_data['stamp_source'].lower() == 'latest':
+                # latest gets the most recent time
+                new_header.stamp = self.get_clock().now().to_msg()
+
+            if self.new_header_data['frame_id'].lower():
+                new_header.frame_id = self.new_header_data['frame_id']
+
+        return new_header
+
     def callback(self, ros_cloud):
         # Check if there are subscribers to the topic published by this node
         if self.pointcloud_pub.get_subscription_count() == 0:
@@ -420,156 +572,22 @@ class PointcloudPreprocessorNode(Node):
         frame_id = ros_cloud.header.frame_id
 
         try:
-            callback_start_time = get_current_time(monotonic=True)
-            try:
-                start_time = get_current_time(monotonic=True)
-                field_names = self.pointcloud_fields if self.pointcloud_fields else None  # ('x', 'y', 'z', 'rgb'),
-                self.pointcloud_dictionary, pointcloud_metadata = pointcloud_to_dict(
-                    ros_cloud, field_names, self.remove_nans, self.organize_cloud)
-
-                if self.pointcloud_metadata is None:
-                    # Optional: Extract additional attributes if present
-                    self.pointcloud_metadata = get_pointcloud_metadata(pointcloud_metadata['field_names'])
-
-                self.pointcloud_metadata.update(pointcloud_metadata)
-                cloud_field_names = self.pointcloud_metadata.get('field_names', None)
-                num_fields = self.pointcloud_metadata['num_fields']
-
-            except Exception as e:
-                self.get_logger().error(f"Failed to convert PointCloud2 message to numpy: {str(e)}")
-                return
-
-            if self.pointcloud_dictionary['cloud_array'].size == 0:
-                self.get_logger().warn("Received an empty PointCloud. Skipping...")
-                return
-
-            self.pointcloud_dictionary.pop('cloud_array')
-
-            # test if x, y, and z are present
-            if not {"x", "y", "z"}.issubset(cloud_field_names):
-                self.get_logger().error("Incoming PointCloud does not have x, y, z fields.")
-                return
-
-            self.processing_times['ros_to_numpy'] = get_time_difference(start_time, get_current_time(monotonic=True))
-
-            # Extract XYZ points
-            start_time = get_current_time(monotonic=True)
-
-            # Extract and convert RGB values
-            if 'rgb' in cloud_field_names and self.pointcloud_metadata['has_rgb']:
-                rgb_arr = extract_rgb_from_pointcloud(self.pointcloud_dictionary['rgb'])
-            else:
-                rgb_arr = None
-
-            self.processing_times['data_preparation'] = get_time_difference(start_time, get_current_time(monotonic=True))
-
-            # Clear previous point and attributes
-            start_time = get_current_time(monotonic=True)
-            self.o3d_pointcloud.clear() # todo: maybe also delete non-header keys from the dictionary
-            self.processing_times['point_clearing'] = get_time_difference(start_time, get_current_time(monotonic=True))
-
-            # Convert numpy arrays to tensors and move to device. We
-            start_time = get_current_time(monotonic=True)
-            self.pointcloud_dictionary['positions'] = o3c.Tensor.from_numpy(self.pointcloud_dictionary['positions'])
-
-            if rgb_arr is not None:
-                rgb_f = rgb_arr.astype(np.float32) / 255.0
-                if check_field('rgb'):
-                    self.pointcloud_dictionary['rgb'] = o3c.Tensor.from_numpy(rgb_f)
-
-            # todo: switch to functools.partial to reduce code duplication
-            self.pointcloud_dictionary = get_fields_from_dicts('intensity', self.pointcloud_dictionary,
-                                                                            self.pointcloud_metadata)
-            self.pointcloud_dictionary = get_fields_from_dicts('ring', self.pointcloud_dictionary,
-                                                                            self.pointcloud_metadata)
-            self.pointcloud_dictionary = get_fields_from_dicts('time', self.pointcloud_dictionary,
-                                                                            self.pointcloud_metadata)
-            self.pointcloud_dictionary = get_fields_from_dicts('return_type', self.pointcloud_dictionary,
-                                                                            self.pointcloud_metadata)
-
-            self.o3d_pointcloud = dict_to_open3d_tensor_pointcloud(self.pointcloud_dictionary, device=self.o3d_device)
-            self.processing_times['tensor_transfer'] = get_time_difference(start_time, get_current_time(monotonic=True))
+            callback_start_time = get_current_time(monotonic=False)
+            self.extract_pointcloud(ros_cloud)
 
             # preprocess the PointCloud
             preprocessing_start_time = get_current_time(monotonic=False)
             self.preprocess()
-            self.processing_times['preprocessing_time'] = get_time_difference(start_time, get_current_time(monotonic=False))
+            self.processing_times['preprocessing_time'] = get_time_difference(preprocessing_start_time, get_current_time(monotonic=False))
 
             # Publish processed point cloud
             start_time = get_current_time(monotonic=True)
-            processed_positions = self.o3d_pointcloud.point.positions.cpu().numpy()
-            num_points = processed_positions.shape[0]
-            # todo: this field name and type extraction should be done once since it is most likely static unless a parameter is updated or the pointcloud type changes which is unlikely
-            orig_field_names = []
-            orig_field_types = []
-
-            for f in ros_cloud.fields:
-                orig_field_names.append(f.name)
-                orig_field_types.append(f.datatype)
-
-            new_dtype = []
-            for name, datatype in zip(orig_field_names, orig_field_types):
-                np_type = FIELD_DTYPE_MAP[datatype]
-                new_dtype.append((name, np_type))
-
-            if self.estimate_normals:
-                orig_field_names.extend(['normal_x', 'normal_y', 'normal_z'])
-                orig_field_types.extend([PointField.FLOAT32, PointField.FLOAT32, PointField.FLOAT32])
-                new_dtype.extend([
-                    ('normal_x', FIELD_DTYPE_MAP[PointField.FLOAT32]),
-                    ('normal_y', FIELD_DTYPE_MAP[PointField.FLOAT32]),
-                    ('normal_z', FIELD_DTYPE_MAP[PointField.FLOAT32])
-                ])
-
-            processed_struct = np.zeros(num_points, dtype=new_dtype)
-            processed_struct["x"] = processed_positions[:, 0]
-            processed_struct["y"] = processed_positions[:, 1]
-            processed_struct["z"] = processed_positions[:, 2]
-
-            # Handle other fields. todo: could do this once instead of for each pointcloud message
-            rgb_np = self.copy_fields('rgb', self.o3d_pointcloud)
-            if rgb_np:
-                rgb_float32 = rgb_int_to_float(rgb_np)
-                processed_struct["rgb"] = rgb_float32
-
-            if check_field('intensity', self.pointcloud_dictionary, self.pointcloud_metadata):
-                intensity_np = self.copy_fields('intensity', self.o3d_pointcloud)
-                processed_struct["intensity"] = intensity_np.astype(processed_struct["intensity"].dtype)
-
-            if check_field('ring', self.pointcloud_dictionary, self.pointcloud_metadata):
-                ring_np = self.copy_fields('ring', self.o3d_pointcloud)
-                processed_struct["ring"] = ring_np.astype(processed_struct["ring"].dtype)
-
-            if check_field('time', self.pointcloud_dictionary, self.pointcloud_metadata):
-                time_np = self.copy_fields('time', self.o3d_pointcloud)
-                processed_struct["time"] = time_np.astype(processed_struct["time"].dtype)
-
-            if self.estimate_normals or check_field('normal_x', self.pointcloud_dictionary, self.pointcloud_metadata):
-                normals_np = self.o3d_pointcloud.point.normals.cpu().numpy()
-                processed_struct["normal_x"] = normals_np[:, 0].astype(processed_struct["normal_x"].dtype)  # normal_* or n*
-                processed_struct["normal_y"] = normals_np[:, 1].astype(processed_struct["normal_y"].dtype)  # normal_* or n*
-                processed_struct["normal_z"] = normals_np[:, 2].astype(processed_struct["normal_z"].dtype)  # normal_* or n*
+            processed_struct = self.prepare_pointcloud(ros_cloud)
 
             # Create PointCloud2 message.
-            new_header = ros_cloud.header
-            if self.override_header:
-                if self.new_header_data['stamp_source'].lower() == 'latest':
-                    # latest gets the most recent time
-                    new_header.stamp = self.get_clock().now().to_msg()
-
-                if self.new_header_data['frame_id'].lower():
-                    new_header.frame_id = self.new_header_data['frame_id']
-
-            # todo: this should be done once and not for each pointcloud message
-            pointfields, point_offset = numpy_struct_to_pointcloud2(
-                    processed_struct,
-                    field_names=orig_field_names,
-                    field_datatypes=orig_field_types,
-                    is_dense=self.remove_nans and self.remove_infs
-            )
-            pc_msg = self.tensor_to_ros_cloud(processed_struct, pointfields, header=new_header)
+            new_header = self.create_header(ros_cloud)
+            pc_msg = self.tensor_to_ros_cloud(processed_struct, self.pointfields, header=new_header)
             pc_msg.is_dense = self.remove_nans and self.remove_infs
-
             self.processing_times['pointcloud_msg_parsing'] = get_time_difference(start_time, get_current_time(monotonic=True))
 
             start_time = get_current_time(monotonic=True)
@@ -581,7 +599,7 @@ class PointcloudPreprocessorNode(Node):
             self.pointcloud_visualizer(pcd_number)
 
             self.frame_count += 1
-            self.processing_times['total_callback_time'] = get_current_time(monotonic=True) - callback_start_time
+            self.processing_times['total_callback_time'] = get_time_difference(callback_start_time, get_current_time(monotonic=False))
 
             # Log processing info
             self.get_logger().info(
@@ -746,7 +764,7 @@ class PointcloudPreprocessorNode(Node):
             except KeyError:
                 # the field does not exist
                 self.get_logger().warn(f"Field name: {field_name_} not found in pointcloud {pointcloud}.",
-                                       throttle_duration_sec=5.0)
+                                       throttle_duration_sec=60.0)  # or just log once
                 processed_fields[field_name_] = None
 
         if isinstance(field_name, str):
@@ -797,6 +815,8 @@ class PointcloudPreprocessorNode(Node):
                                                "Using CPU for Open3D functions instead instead.")
                         self.use_gpu = False
                         result.successful = False
+                        result.reason = 'Open3D was not installed/built with CUDA support. ' \
+                                         'Using CPU for Open3D functions instead instead.'
 
             elif param.name == 'cpu_backend' and param.type_ == Parameter.Type.STRING:
                 self.cpu_backend = param.value
@@ -837,8 +857,12 @@ class PointcloudPreprocessorNode(Node):
                 min_bound = o3c.Tensor(self.roi_min, dtype=o3c.Dtype.Float32)
                 max_bound = o3c.Tensor(self.roi_max, dtype=o3c.Dtype.Float32)
                 self.crop_aabb = o3d.t.geometry.AxisAlignedBoundingBox(min_bound, max_bound).to(self.o3d_device)
+                self.passthrough_filter = partial(crop_pointcloud, min_bound=self.roi_min, max_bound=self.roi_max,
+                                                  invert=self.crop_to_roi_invert, aabb=self.crop_aabb)
             elif param.name == 'crop_to_roi.invert' and param.type_ == Parameter.Type.BOOL:
                 self.crop_to_roi_invert = param.value
+                self.passthrough_filter = partial(crop_pointcloud, min_bound=self.roi_min, max_bound=self.roi_max,
+                                                  invert=self.crop_to_roi_invert, aabb=self.crop_aabb)
             elif param.name in ['roi_min', 'roi_max'] and param.type_ == Parameter.Type.DOUBLE_ARRAY:
                 roi_ = param.value
                 if len(roi_) == 3:
@@ -846,18 +870,24 @@ class PointcloudPreprocessorNode(Node):
                         self.roi_min = roi_
                     else:
                         self.roi_max = roi_
+                    self.passthrough_filter = partial(crop_pointcloud, min_bound=self.roi_min, max_bound=self.roi_max,
+                                                      invert=self.crop_to_roi_invert, aabb=self.crop_aabb)
                 else:
                     result.successful = False
+                    result.reason = "ROI min/max must be of length 3"
             elif param.name == 'voxel_size' and param.type_ == Parameter.Type.DOUBLE:
                 self.voxel_size = param.value
             elif param.name == 'remove_statistical_outliers' and param.type_ == Parameter.Type.BOOL:
                 self.remove_statistical_outliers = param.value
             elif param.name == 'remove_statistical_outliers.nb_neighbors' and param.type_ == Parameter.Type.INT:
                 self.remove_statistical_outliers_nb_neighbors = param.value
-            elif pram.name == 'remove_statistical_outliers.std_ratio' and param.type_ == Parameter.Type.DOUBLE:
+            elif param.name == 'remove_statistical_outliers.std_ratio' and param.type_ == Parameter.Type.DOUBLE:
                 self.remove_statistical_outliers_std_ratio = param.value
             elif param.name == 'estimate_normals' and param.type_ == Parameter.Type.BOOL:
                 self.estimate_normals = param.value
+                self.reset_fields = True
+                if not self.estimate_normals:
+                    self.pointcloud_metadata.pop('has_normals')
             elif param.name == 'estimate_normals.search_radius' and param.type_ == Parameter.Type.DOUBLE:
                 self.estimate_normals_search_radius = param.value
             elif param.name == 'estimate_normals.max_neighbors' and param.type_ == Parameter.Type.INT:
