@@ -172,7 +172,18 @@ class PointcloudPreprocessorNode(Node):
         self.declare_parameter(f'{self.parameter_namespace}visualize.save_visualizer_image', False)
         self.declare_parameter(f'{self.parameter_namespace}visualize.visualizer_image_path', './images')
 
-        # Get parameters. todo: self.get_parameters_by_prefix(prefix=self.parameter_namespace.rstrip('.')) returns a dictionary of parameters so will need to be called once then other parameters will be keys in the dictionary
+        # Get parameters.
+        # # # todo: self.get_parameters_by_prefix(prefix=self.parameter_namespace.rstrip('.')) returns a dictionary of parameters so will need to be called once then other parameters will be keys in the dictionary
+        # # # ######################
+        # self.parameters = self.get_parameters_by_prefix(prefix=self.parameter_namespace.rstrip('.'))
+        # self.use_sim_time = self.parameters.get('use_sim_time').get_parameter_value().bool_value
+        # self.input_topic = self.parameters.get(f'{self.parameter_namespace}input_topic').value
+        # self.output_topic = self.parameters.get(f'{self.parameter_namespace}output_topic').value
+        # self.qos = self.parameters.get(f'{self.parameter_namespace}qos').get_parameter_value().string_value
+        # self.pointcloud_fields = self.parameters.get(f'{self.parameter_namespace}pointcloud_fields').value
+        # self.queue_size = self.parameters.get(f'{self.parameter_namespace}queue_size').value
+        # self.use_gpu = self.parameters.get(f'{self.parameter_namespace}use_gpu').value
+        # # # ######################
         self.use_sim_time = self.get_parameter(f'use_sim_time').get_parameter_value().bool_value
         self.input_topic = self.get_parameter(f'{self.parameter_namespace}input_topic').value
         self.output_topic = self.get_parameter(f'{self.parameter_namespace}output_topic').value
@@ -263,11 +274,6 @@ class PointcloudPreprocessorNode(Node):
             max_bound = o3c.Tensor(self.roi_max, dtype=o3c.Dtype.Float32)
             self.crop_aabb = o3d.t.geometry.AxisAlignedBoundingBox(min_bound, max_bound).to(self.o3d_device)
 
-
-            # ##### todo: remove
-            sys.path = ['', '/opt/ros/humble/lib/python3.10/site-packages', '/opt/ros/humble/local/lib/python3.10/dist-packages', '/mnt/c/Users/boluo/OneDrive - Florida State University/Projects/autodriver/autodriver_perception', '/home/privvyledge/.local/bin', '/usr/lib/python310.zip', '/usr/lib/python3.10', '/usr/lib/python3.10/lib-dynload', '/home/privvyledge/python3_venvs/py310_venv/lib/python3.10/site-packages', '/home/privvyledge/GitRepos/GroundingDINO', '/home/privvyledge/python3_venvs/py310_venv/lib/python3.10/site-packages/pymesh2-0.3-py3.10-linux-x86_64.egg', '/home/privvyledge/GitRepos/mmdetection3d', '/home/privvyledge/GitRepos/mmyolo', '/home/privvyledge/python3_venvs/py310_venv/lib/python3.10/site-packages/autodistill_qwen_vl-0.1.0-py3.10.egg', '/home/privvyledge/GitRepos/mmdetection']
-            sys.path.extend(['/mnt/c/Users/boluo/OneDrive - Florida State University/Projects/autodriver/autodriver_perception/autodriver_pointcloud_preprocessor', '/mnt/c/Users/boluo/OneDrive - Florida State University/Projects/autodriver/autodriver_perception/autodriver_pointcloud_preprocessor/autodriver_pointcloud_preprocessor'])
-            # ##### todo: remove
             self.passthrough_filter = partial(crop_pointcloud, min_bound=self.roi_min, max_bound=self.roi_max,
                                          invert=self.crop_to_roi_invert, aabb=self.crop_aabb)
         self.pointcloud_metadata = None
@@ -278,13 +284,13 @@ class PointcloudPreprocessorNode(Node):
         self.processing_times = {}
 
         # setup QoS
-        qos_profile = QoSProfile(
+        self.qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=self.queue_size
         )
         if self.qos.lower() == "sensor_data":
-            qos_profile = QoSProfile(
+            self.qos_profile = QoSProfile(
                 reliability=QoSReliabilityPolicy.BEST_EFFORT,
                 history=QoSHistoryPolicy.KEEP_LAST,
                 depth=self.queue_size
@@ -330,7 +336,7 @@ class PointcloudPreprocessorNode(Node):
             # change one or more parameters of the node.
             self.add_on_set_parameters_callback(self.parameter_change_callback)
             self.poincloud_sub = self.create_subscription(PointCloud2, self.input_topic,
-                                                          self.callback, qos_profile=qos_profile)
+                                                          self.callback, qos_profile=self.qos_profile)
 
             # Setup publishers
             self.pointcloud_pub = self.create_publisher(PointCloud2, self.output_topic, self.queue_size)
@@ -420,7 +426,7 @@ class PointcloudPreprocessorNode(Node):
                 self.o3d_pointcloud, dupl_msg = remove_duplicates(self.o3d_pointcloud, self.gpu_backend)
 
             else:
-                self.get_logger().info('No valid device/backend found. Using torch for duplicate removal.')
+                # self.get_logger().info('No valid device/backend found. Using torch for duplicate removal.')
                 self.o3d_pointcloud, dupl_msg = remove_duplicates(self.o3d_pointcloud, 'torch')
 
             # self.get_logger().info(dupl_msg)
@@ -457,7 +463,7 @@ class PointcloudPreprocessorNode(Node):
                 self.o3d_pointcloud, crop_msg = self.passthrough_filter(self.o3d_pointcloud, backend=self.gpu_backend)
 
             else:
-                self.get_logger().info('No valid device/backend found. Using open3d backend for pointcloud cropping.')
+                # self.get_logger().info('No valid device/backend found. Using open3d backend for pointcloud cropping.')
                 self.o3d_pointcloud, crop_msg = crop_pointcloud(self.o3d_pointcloud, backend='open3d')
             # self.get_logger().info(crop_msg)
             self.processing_times['crop'] = get_time_difference(start_time, get_current_time(monotonic=True))
@@ -616,11 +622,11 @@ class PointcloudPreprocessorNode(Node):
             self.frame_count += 1
             self.processing_times['total_callback_time'] = get_time_difference(callback_start_time, get_current_time(monotonic=False))
 
-            # Log processing info
-            self.get_logger().info(
-                    f"Published processed pointcloud with "
-                    f"{self.o3d_pointcloud.point.positions.shape[0]} points"
-            )
+            # # Log processing info
+            # self.get_logger().info(
+            #         f"Published processed pointcloud with "
+            #         f"{self.o3d_pointcloud.point.positions.shape[0]} points"
+            # )
 
             # self.get_logger().info(
             #         f"\n Ros to numpy: {1 / self.processing_times['ros_to_numpy']}, "
@@ -800,24 +806,31 @@ class PointcloudPreprocessorNode(Node):
 
         Returns:
             SetParametersResult: Object indicating whether the change was successful.
+
+        Bugs:
+            1. Resetting input and output topics does not work since ROS has problems destroying and creating topics
         """
         result = SetParametersResult()
         result.successful = True
 
         # Iterate over each parameter in this node
         for param in params:
-            if param.name == 'input_topic' and param.type_ == Parameter.Type.STRING:
-                self.poincloud_sub.destroy()
+            if param.name == f'{self.parameter_namespace}input_topic' and param.type_ == Parameter.Type.STRING:
+                # self.poincloud_sub.destroy()
+                self.destroy_subscription(self.poincloud_sub)
+                time.sleep(0.5)
                 self.input_topic = param.value
                 self.poincloud_sub = self.create_subscription(PointCloud2, self.input_topic,
-                                                              self.callback, qos_profile=qos_profile)
+                                                              self.callback, qos_profile=self.qos_profile)
 
-            elif param.name == 'output_topic' and param.type_ == Parameter.Type.STRING:
-                self.pointcloud_pub.destroy()
+            elif param.name == f'{self.parameter_namespace}output_topic' and param.type_ == Parameter.Type.STRING:
+                # self.pointcloud_pub.destroy()
+                self.destroy_publisher(self.pointcloud_pub)
+                time.sleep(0.5)
                 self.output_topic = param.value
                 self.pointcloud_pub = self.create_publisher(PointCloud2, self.output_topic, self.queue_size)
 
-            elif param.name == 'use_gpu' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}use_gpu' and param.type_ == Parameter.Type.BOOL:
                 # first set all to CPU
                 self.torch_device = torch.device('cpu')
                 self.o3d_device = o3d.core.Device('CPU:0')
@@ -843,55 +856,55 @@ class PointcloudPreprocessorNode(Node):
                         result.reason = 'Open3D was not installed/built with CUDA support. ' \
                                          'Using CPU for Open3D functions instead instead.'
 
-            elif param.name == 'cpu_backend' and param.type_ == Parameter.Type.STRING:
+            elif param.name == f'{self.parameter_namespace}cpu_backend' and param.type_ == Parameter.Type.STRING:
                 self.cpu_backend = param.value
-            elif param.name == 'gpu_backend' and param.type_ == Parameter.Type.STRING:
+            elif param.name == f'{self.parameter_namespace}gpu_backend' and param.type_ == Parameter.Type.STRING:
                 self.gpu_backend = param.value
-            elif param.name == 'robot_frame' and param.type_ == Parameter.Type.STRING:
+            elif param.name == f'{self.parameter_namespace}robot_frame' and param.type_ == Parameter.Type.STRING:
                 self.robot_frame = param.value
                 try:
                     self.new_header_data['stamp_source'] = param.value
                 except NameError:
                     pass
-            elif param.name == 'static_camera_to_robot_tf' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}static_camera_to_robot_tf' and param.type_ == Parameter.Type.BOOL:
                 self.static_camera_to_robot_tf = param.value
-            elif param.name == 'transform_timeout' and param.type_ == Parameter.Type.DOUBLE:
+            elif param.name == f'{self.parameter_namespace}transform_timeout' and param.type_ == Parameter.Type.DOUBLE:
                 self.transform_timeout = param.value
-            elif param.name == 'organize_cloud' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}organize_cloud' and param.type_ == Parameter.Type.BOOL:
                 self.organize_cloud = param.value
-            elif param.name == 'save_pointcloud' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}save_pointcloud' and param.type_ == Parameter.Type.BOOL:
                 self.save_pointcloud = param.value
-            elif param.name == 'pointcloud_save_directory' and param.type_ == Parameter.Type.STRING:
+            elif param.name == f'{self.parameter_namespace}pointcloud_save_directory' and param.type_ == Parameter.Type.STRING:
                 self.pointcloud_save_directory = param.value
-            elif param.name == 'pointcloud_save_prepend_str' and param.type_ == Parameter.Type.STRING:
+            elif param.name == f'{self.parameter_namespace}pointcloud_save_prepend_str' and param.type_ == Parameter.Type.STRING:
                 self.pointcloud_save_prepend_str = param.value
-            elif param.name == 'pointcloud_save_extension' and param.type_ == Parameter.Type.STRING:
+            elif param.name == f'{self.parameter_namespace}pointcloud_save_extension' and param.type_ == Parameter.Type.STRING:
                 self.pointcloud_save_extension = param.value
-            elif param.name == 'pointcloud_save_ascii' and param.type_ == Parameter.Type.STRING:
+            elif param.name == f'{self.parameter_namespace}pointcloud_save_ascii' and param.type_ == Parameter.Type.STRING:
                 self.pointcloud_save_ascii = param.value
-            elif param.name == 'pointcloud_save_compressed' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}pointcloud_save_compressed' and param.type_ == Parameter.Type.BOOL:
                 self.pointcloud_save_compressed = param.value
-            elif param.name == 'remove_duplicates' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}remove_duplicates' and param.type_ == Parameter.Type.BOOL:
                 self.remove_duplicates = param.value
-            elif param.name == 'remove_nans' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}remove_nans' and param.type_ == Parameter.Type.BOOL:
                 self.remove_nans = param.value
-            elif param.name == 'remove_infs' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}remove_infs' and param.type_ == Parameter.Type.BOOL:
                 self.remove_infs = param.value
-            elif param.name == 'crop_to_roi' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}crop_to_roi' and param.type_ == Parameter.Type.BOOL:
                 self.crop_to_roi = param.value
                 min_bound = o3c.Tensor(self.roi_min, dtype=o3c.Dtype.Float32)
                 max_bound = o3c.Tensor(self.roi_max, dtype=o3c.Dtype.Float32)
                 self.crop_aabb = o3d.t.geometry.AxisAlignedBoundingBox(min_bound, max_bound).to(self.o3d_device)
                 self.passthrough_filter = partial(crop_pointcloud, min_bound=self.roi_min, max_bound=self.roi_max,
                                                   invert=self.crop_to_roi_invert, aabb=self.crop_aabb)
-            elif param.name == 'crop_to_roi.invert' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}crop_to_roi.invert' and param.type_ == Parameter.Type.BOOL:
                 self.crop_to_roi_invert = param.value
                 self.passthrough_filter = partial(crop_pointcloud, min_bound=self.roi_min, max_bound=self.roi_max,
                                                   invert=self.crop_to_roi_invert, aabb=self.crop_aabb)
-            elif param.name in ['roi_min', 'roi_max'] and param.type_ == Parameter.Type.DOUBLE_ARRAY:
+            elif param.name in [f'{self.parameter_namespace}roi_min', f'{self.parameter_namespace}roi_max'] and param.type_ == Parameter.Type.DOUBLE_ARRAY:
                 roi_ = param.value
                 if len(roi_) == 3:
-                    if param.name == 'roi_min':
+                    if param.name == f'{self.parameter_namespace}roi_min':
                         self.roi_min = roi_
                     else:
                         self.roi_max = roi_
@@ -900,48 +913,48 @@ class PointcloudPreprocessorNode(Node):
                 else:
                     result.successful = False
                     result.reason = "ROI min/max must be of length 3"
-            elif param.name == 'voxel_size' and param.type_ == Parameter.Type.DOUBLE:
+            elif param.name == f'{self.parameter_namespace}voxel_size' and param.type_ == Parameter.Type.DOUBLE:
                 self.voxel_size = param.value
-            elif param.name == 'remove_statistical_outliers' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}remove_statistical_outliers' and param.type_ == Parameter.Type.BOOL:
                 self.remove_statistical_outliers = param.value
-            elif param.name == 'remove_statistical_outliers.nb_neighbors' and param.type_ == Parameter.Type.INT:
+            elif param.name == f'{self.parameter_namespace}remove_statistical_outliers.nb_neighbors' and param.type_ == Parameter.Type.INT:
                 self.remove_statistical_outliers_nb_neighbors = param.value
-            elif param.name == 'remove_statistical_outliers.std_ratio' and param.type_ == Parameter.Type.DOUBLE:
+            elif param.name == f'{self.parameter_namespace}remove_statistical_outliers.std_ratio' and param.type_ == Parameter.Type.DOUBLE:
                 self.remove_statistical_outliers_std_ratio = param.value
-            elif param.name == 'estimate_normals' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}estimate_normals' and param.type_ == Parameter.Type.BOOL:
                 self.estimate_normals = param.value
                 self.reset_fields = True
                 if not self.estimate_normals:
                     self.pointcloud_metadata.pop('has_normals')
-            elif param.name == 'estimate_normals.search_radius' and param.type_ == Parameter.Type.DOUBLE:
+            elif param.name == f'{self.parameter_namespace}estimate_normals.search_radius' and param.type_ == Parameter.Type.DOUBLE:
                 self.estimate_normals_search_radius = param.value
-            elif param.name == 'estimate_normals.max_neighbors' and param.type_ == Parameter.Type.INT:
+            elif param.name == f'{self.parameter_namespace}estimate_normals.max_neighbors' and param.type_ == Parameter.Type.INT:
                 self.estimate_normals_max_neighbors = param.value
-            elif param.name == 'remove_ground' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}remove_ground' and param.type_ == Parameter.Type.BOOL:
                 self.remove_ground = param.value
-            elif param.name == 'remove_ground.distance_threshold' and param.type_ == Parameter.Type.DOUBLE:
+            elif param.name == f'{self.parameter_namespace}remove_ground.distance_threshold' and param.type_ == Parameter.Type.DOUBLE:
                 self.remove_ground_distance_threshold = param.value
-            elif param.name == 'remove_ground.ransac_number' and param.type_ == Parameter.Type.INT:
+            elif param.name == f'{self.parameter_namespace}remove_ground.ransac_number' and param.type_ == Parameter.Type.INT:
                 self.remove_ground_ransac_number = param.value
-            elif param.name == 'remove_ground.num_iterations' and param.type_ == Parameter.Type.INT:
+            elif param.name == f'{self.parameter_namespace}remove_ground.num_iterations' and param.type_ == Parameter.Type.INT:
                 self.remove_ground_num_iterations = param.value
-            elif param.name == 'remove_ground.probability' and param.type_ == Parameter.Type.DOUBLE:
+            elif param.name == f'{self.parameter_namespace}remove_ground.probability' and param.type_ == Parameter.Type.DOUBLE:
                 self.remove_ground_probability = param.value
-            elif param.name == 'ground_plane' and param.type_ == Parameter.Type.DOUBLE_ARRAY:
+            elif param.name == f'{self.parameter_namespace}ground_plane' and param.type_ == Parameter.Type.DOUBLE_ARRAY:
                 self.ground_plane = param.value
-            elif param.name == 'use_height' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}use_height' and param.type_ == Parameter.Type.BOOL:
                 self.use_height = param.value
-            elif param.name == 'override_header' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}override_header' and param.type_ == Parameter.Type.BOOL:
                 self.override_header = param.value
                 if self.override_header:
                     self.new_header_data = {
                         'frame_id': self.robot_frame,
                         'stamp_source': self.get_parameter(f'{self.parameter_namespace}override_header.stamp_source').value
                     }
-            elif param.name == 'override_header.stamp_source' and param.type_ == Parameter.Type.STRING:
+            elif param.name == f'{self.parameter_namespace}override_header.stamp_source' and param.type_ == Parameter.Type.STRING:
                 self.new_header_data['stamp_source'] = param.value
             # todo: setup visualizer and options. Also add visualizer destruction if set to False
-            elif param.name == 'visualize' and param.type_ == Parameter.Type.BOOL:
+            elif param.name == f'{self.parameter_namespace}visualize' and param.type_ == Parameter.Type.BOOL:
                 self.visualize = param.value
             else:
                 result.successful = False
