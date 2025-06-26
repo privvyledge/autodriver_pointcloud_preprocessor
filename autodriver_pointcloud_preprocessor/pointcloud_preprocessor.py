@@ -24,11 +24,15 @@ Todo:
     * optimize ROS <--> Open3D extraction, i.e PointCloud from dictionary (and test with GPU) [done]
     * Add parameters for all preprocessing functions and make them modular to be used in composable nodes [done]
     * use "partial" from functools [done]
+    * test changing input/output pointcloud topics
+    * add separate parameters for ROI cropping
     * initialize the timing dict once then print if debug
     * add numpy and torch based nan and infinite point removal (https://github.com/SeungBack/open3d-ros-helper/blob/master/open3d_ros_helper/open3d_ros_helper.py#L262)
     * replace infinite/nan removal with numpy and torch native operations
     * Compare my cropping function with (https://github.com/SeungBack/open3d-ros-helper/blob/master/open3d_ros_helper/open3d_ros_helper.py#L385)
     * test pointcloud transformation to different frames (do this with the US DOT dataset)
+    * move transformation functions (get_camera_to_robot_tf, transform_to_matrix) to utils
+    * add namespace to "declare_parameters"
     * add other preprocessing steps such as furthest point downsampling, uniform downsampling, random downsampling, radius outlier removal, etc.
         * See https://www.open3d.org/docs/release/python_api/open3d.t.geometry.PointCloud.html
     * add good defaults for all parameters, e.g n * voxel_size. See Open3D documentation for more details.
@@ -38,6 +42,7 @@ Todo:
     * Create torch version of unpacking pointclouds (https://github.com/ros2/common_interfaces/blob/humble/sensor_msgs_py/sensor_msgs_py/point_cloud2.py | https://gist.github.com/SebastianGrans/6ae5cab66e453a14a859b66cd9579239)
         * Use tensordict to copy to torch tensors at once instead of Open3D tensors then use dlpack to transfer ownership of each tensor (https://github.com/pytorch/tensordict/blob/main/GETTING_STARTED.md | https://github.com/pytorch/tensordict)
         * Compare Torch tensordicts to open3d tensors
+    * switch to self.get_parameters_by_prefix(prefix) and set prefix to parameter namespace instead of self.get_parameter(f'{parameter_namespace}
     * Optimize different names/fields from different vendors and unify in a dictionary
     * add onetime height/ground estimation from my autodriving transformer code
     * Create a Python "package" for standalone non-ROS use then just import that here
@@ -95,127 +100,131 @@ from autodriver_pointcloud_preprocessor.utils import (convert_pointcloud_to_nump
 
 
 class PointcloudPreprocessorNode(Node):
-    def __init__(self, node_name='pointcloud_preprocessor', enabled=True):
+    def __init__(self, node_name='pointcloud_preprocessor', enabled=True, parameter_namespace=''):
         super(PointcloudPreprocessorNode, self).__init__(node_name)
+        if parameter_namespace:
+            parameter_namespace = f'{parameter_namespace.rstrip(".")}.'
+
+        self.parameter_namespace = parameter_namespace
 
         # Declare parameters
-        self.declare_parameter(name='input_topic', value="/velodyne_front/velodyne_points",  # /camera/camera/depth/color/points, /lidar1/velodyne_points , /velodyne_front/velodyne_points,
+        self.declare_parameter(name=f'{self.parameter_namespace}input_topic', value="/velodyne_front/velodyne_points",  # /camera/camera/depth/color/points, /lidar1/velodyne_points , /velodyne_front/velodyne_points,
                                descriptor=ParameterDescriptor(
                                    description='',
                                    type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='output_topic', value="/lidar1/velodyne_points/processed",
+        self.declare_parameter(name=f'{self.parameter_namespace}output_topic', value="/lidar1/velodyne_points/processed",
                                # /camera/camera/depth/color/points/processed
                                descriptor=ParameterDescriptor(
                                    description='',
                                    type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter(name='qos', value="SENSOR_DATA", descriptor=ParameterDescriptor(
+        self.declare_parameter(name=f'{self.parameter_namespace}qos', value="SENSOR_DATA", descriptor=ParameterDescriptor(
             description='',
             type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter('pointcloud_fields', [])
-        self.declare_parameter('queue_size', 1)
-        self.declare_parameter('use_gpu', True)
-        self.declare_parameter('cpu_backend', 'torch')  # numpy, pytorch or open3d
-        self.declare_parameter('gpu_backend', 'open3d')  # pytorch or open3d
-        self.declare_parameter('robot_frame', '')
-        self.declare_parameter('static_camera_to_robot_tf', True)
-        self.declare_parameter('transform_timeout', 0.1)
-        self.declare_parameter('organize_cloud', False)
-        self.declare_parameter('save_pointcloud', False)
-        self.declare_parameter('pointcloud_save_directory', './pointclouds/')
-        self.declare_parameter('pointcloud_save_prepend_str', '')
-        self.declare_parameter('pointcloud_save_extension', '.pcd')  # .pcd, .ply, .pts, .xyzrgb, .xyzn, .xyzn
-        self.declare_parameter('pointcloud_save_ascii', False)  # False: 'binary', True: 'ascii'
-        self.declare_parameter('pointcloud_save_compressed', False)
+        self.declare_parameter(f'{self.parameter_namespace}pointcloud_fields', [])
+        self.declare_parameter(f'{self.parameter_namespace}queue_size', 1)
+        self.declare_parameter(f'{self.parameter_namespace}use_gpu', True)
+        self.declare_parameter(f'{self.parameter_namespace}cpu_backend', 'torch')  # numpy, pytorch or open3d
+        self.declare_parameter(f'{self.parameter_namespace}gpu_backend', 'open3d')  # pytorch or open3d
+        self.declare_parameter(f'{self.parameter_namespace}robot_frame', '')
+        self.declare_parameter(f'{self.parameter_namespace}static_camera_to_robot_tf', True)
+        self.declare_parameter(f'{self.parameter_namespace}transform_timeout', 0.1)
+        self.declare_parameter(f'{self.parameter_namespace}organize_cloud', False)
+        self.declare_parameter(f'{self.parameter_namespace}save_pointcloud', False)
+        self.declare_parameter(f'{self.parameter_namespace}pointcloud_save_directory', './pointclouds/')
+        self.declare_parameter(f'{self.parameter_namespace}pointcloud_save_prepend_str', '')
+        self.declare_parameter(f'{self.parameter_namespace}pointcloud_save_extension', '.pcd')  # .pcd, .ply, .pts, .xyzrgb, .xyzn, .xyzn
+        self.declare_parameter(f'{self.parameter_namespace}pointcloud_save_ascii', False)  # False: 'binary', True: 'ascii'
+        self.declare_parameter(f'{self.parameter_namespace}pointcloud_save_compressed', False)
 
-        self.declare_parameter('remove_duplicates', True)
-        self.declare_parameter('remove_nans', True)
-        self.declare_parameter('remove_infs', True)  # False
-        self.declare_parameter('crop_to_roi', True)
-        self.declare_parameter('crop_to_roi.invert', False)  # True: keeps points outside the ROI, False: keeps points inside the ROI. Default is False.
-        self.declare_parameter('roi_min', [-60.0, -60.0, -20.0])  # [-6.0, -6.0, -0.05]
-        self.declare_parameter('roi_max', [60.0, 60.0, 20.0])  # [6.0, 6.0, 2.0]
-        self.declare_parameter('voxel_size', 0.01)  # 0.01
-        self.declare_parameter('remove_statistical_outliers', False)
-        self.declare_parameter('remove_statistical_outliers.nb_neighbors', 20)
-        self.declare_parameter('remove_statistical_outliers.std_ratio', 2.0)
-        self.declare_parameter('estimate_normals', True)
-        self.declare_parameter('estimate_normals.search_radius', 0.1)
-        self.declare_parameter('estimate_normals.max_neighbors', 30)
-        self.declare_parameter('remove_ground', False)
-        self.declare_parameter('remove_ground.distance_threshold', 0.2)  # distance threshold for ground segmentation
-        self.declare_parameter('remove_ground.ransac_number', 5)  # number of points to sample for RANSAC
-        self.declare_parameter('remove_ground.num_iterations', 100)
-        self.declare_parameter('remove_ground.probability', 0.99)  # probability of finding a plane
-        self.declare_parameter('ground_plane', [0.0, 1.0, 0.0, 0.0])
-        self.declare_parameter('use_height', True)  # if true, remove the ground based on height
+        self.declare_parameter(f'{self.parameter_namespace}remove_duplicates', True)
+        self.declare_parameter(f'{self.parameter_namespace}remove_nans', True)
+        self.declare_parameter(f'{self.parameter_namespace}remove_infs', True)  # False
+        self.declare_parameter(f'{self.parameter_namespace}crop_to_roi', True)
+        self.declare_parameter(f'{self.parameter_namespace}crop_to_roi.invert', False)  # True: keeps points outside the ROI, False: keeps points inside the ROI. Default is False.
+        self.declare_parameter(f'{self.parameter_namespace}roi_min', [-60.0, -60.0, -20.0])  # [-6.0, -6.0, -0.05]
+        self.declare_parameter(f'{self.parameter_namespace}roi_max', [60.0, 60.0, 20.0])  # [6.0, 6.0, 2.0]
+        self.declare_parameter(f'{self.parameter_namespace}voxel_size', 0.01)  # 0.01
+        self.declare_parameter(f'{self.parameter_namespace}remove_statistical_outliers', False)
+        self.declare_parameter(f'{self.parameter_namespace}remove_statistical_outliers.nb_neighbors', 20)
+        self.declare_parameter(f'{self.parameter_namespace}remove_statistical_outliers.std_ratio', 2.0)
+        self.declare_parameter(f'{self.parameter_namespace}estimate_normals', True)
+        self.declare_parameter(f'{self.parameter_namespace}estimate_normals.search_radius', 0.1)
+        self.declare_parameter(f'{self.parameter_namespace}estimate_normals.max_neighbors', 30)
+        self.declare_parameter(f'{self.parameter_namespace}remove_ground', False)
+        self.declare_parameter(f'{self.parameter_namespace}remove_ground.distance_threshold', 0.2)  # distance threshold for ground segmentation
+        self.declare_parameter(f'{self.parameter_namespace}remove_ground.ransac_number', 5)  # number of points to sample for RANSAC
+        self.declare_parameter(f'{self.parameter_namespace}remove_ground.num_iterations', 100)
+        self.declare_parameter(f'{self.parameter_namespace}remove_ground.probability', 0.99)  # probability of finding a plane
+        self.declare_parameter(f'{self.parameter_namespace}ground_plane', [0.0, 1.0, 0.0, 0.0])
+        self.declare_parameter(f'{self.parameter_namespace}use_height', True)  # if true, remove the ground based on height
 
-        self.declare_parameter('override_header', False)
-        self.declare_parameter('override_header.stamp_source', 'latest')  # copy, latest
+        self.declare_parameter(f'{self.parameter_namespace}override_header', False)
+        self.declare_parameter(f'{self.parameter_namespace}override_header.stamp_source', 'latest')  # copy, latest
 
-        self.declare_parameter('visualize', False)
-        self.declare_parameter('visualize.window_name', 'Open3D')
-        self.declare_parameter('visualize.window_width', 1920)
-        self.declare_parameter('visualize.window_height', 1080)
-        self.declare_parameter('visualize.zoom', 0.0)
-        self.declare_parameter('visualize.front', [])
-        self.declare_parameter('visualize.lookat', [])
-        self.declare_parameter('visualize.up', [])
-        self.declare_parameter('visualize.save_visualizer_image', False)
-        self.declare_parameter('visualize.visualizer_image_path', './images')
+        self.declare_parameter(f'{self.parameter_namespace}visualize', False)
+        self.declare_parameter(f'{self.parameter_namespace}visualize.window_name', 'Open3D')
+        self.declare_parameter(f'{self.parameter_namespace}visualize.window_width', 1920)
+        self.declare_parameter(f'{self.parameter_namespace}visualize.window_height', 1080)
+        self.declare_parameter(f'{self.parameter_namespace}visualize.zoom', 0.0)
+        self.declare_parameter(f'{self.parameter_namespace}visualize.front', [])
+        self.declare_parameter(f'{self.parameter_namespace}visualize.lookat', [])
+        self.declare_parameter(f'{self.parameter_namespace}visualize.up', [])
+        self.declare_parameter(f'{self.parameter_namespace}visualize.save_visualizer_image', False)
+        self.declare_parameter(f'{self.parameter_namespace}visualize.visualizer_image_path', './images')
 
-        # Get parameters
-        self.use_sim_time = self.get_parameter('use_sim_time').get_parameter_value().bool_value
-        self.input_topic = self.get_parameter('input_topic').value
-        self.output_topic = self.get_parameter('output_topic').value
-        self.qos = self.get_parameter('qos').get_parameter_value().string_value
-        self.pointcloud_fields = self.get_parameter('pointcloud_fields').value
-        self.queue_size = self.get_parameter('queue_size').value
-        self.use_gpu = self.get_parameter('use_gpu').value
-        self.cpu_backend = self.get_parameter('cpu_backend').value
-        self.gpu_backend = self.get_parameter('gpu_backend').value
-        self.robot_frame = self.get_parameter('robot_frame').value
-        self.static_camera_to_robot_tf = self.get_parameter('static_camera_to_robot_tf').value
-        self.transform_timeout = self.get_parameter('transform_timeout').value
-        self.organize_cloud = self.get_parameter('organize_cloud').value
-        self.save_pointcloud = self.get_parameter('save_pointcloud').value
-        self.pointcloud_save_directory = self.get_parameter('pointcloud_save_directory').value
+        # Get parameters. todo: self.get_parameters_by_prefix(prefix=self.parameter_namespace.rstrip('.')) returns a dictionary of parameters so will need to be called once then other parameters will be keys in the dictionary
+        self.use_sim_time = self.get_parameter(f'use_sim_time').get_parameter_value().bool_value
+        self.input_topic = self.get_parameter(f'{self.parameter_namespace}input_topic').value
+        self.output_topic = self.get_parameter(f'{self.parameter_namespace}output_topic').value
+        self.qos = self.get_parameter(f'{self.parameter_namespace}qos').get_parameter_value().string_value
+        self.pointcloud_fields = self.get_parameter(f'{self.parameter_namespace}pointcloud_fields').value
+        self.queue_size = self.get_parameter(f'{self.parameter_namespace}queue_size').value
+        self.use_gpu = self.get_parameter(f'{self.parameter_namespace}use_gpu').value
+        self.cpu_backend = self.get_parameter(f'{self.parameter_namespace}cpu_backend').value
+        self.gpu_backend = self.get_parameter(f'{self.parameter_namespace}gpu_backend').value
+        self.robot_frame = self.get_parameter(f'{self.parameter_namespace}robot_frame').value
+        self.static_camera_to_robot_tf = self.get_parameter(f'{self.parameter_namespace}static_camera_to_robot_tf').value
+        self.transform_timeout = self.get_parameter(f'{self.parameter_namespace}transform_timeout').value
+        self.organize_cloud = self.get_parameter(f'{self.parameter_namespace}organize_cloud').value
+        self.save_pointcloud = self.get_parameter(f'{self.parameter_namespace}save_pointcloud').value
+        self.pointcloud_save_directory = self.get_parameter(f'{self.parameter_namespace}pointcloud_save_directory').value
         if self.save_pointcloud:
             os.makedirs(self.pointcloud_save_directory, exist_ok=True)
         if not self.pointcloud_save_directory:
             self.pointcloud_save_directory = '.'  # os.getcwd()
-        self.pointcloud_save_prepend_str = self.get_parameter('pointcloud_save_prepend_str').value
-        self.pointcloud_save_extension = self.get_parameter('pointcloud_save_extension').value
-        self.pointcloud_save_ascii = self.get_parameter('pointcloud_save_ascii').value
-        self.pointcloud_save_compressed = self.get_parameter('pointcloud_save_compressed').value
+        self.pointcloud_save_prepend_str = self.get_parameter(f'{self.parameter_namespace}pointcloud_save_prepend_str').value
+        self.pointcloud_save_extension = self.get_parameter(f'{self.parameter_namespace}pointcloud_save_extension').value
+        self.pointcloud_save_ascii = self.get_parameter(f'{self.parameter_namespace}pointcloud_save_ascii').value
+        self.pointcloud_save_compressed = self.get_parameter(f'{self.parameter_namespace}pointcloud_save_compressed').value
 
-        self.remove_duplicates = self.get_parameter('remove_duplicates').get_parameter_value().bool_value
-        self.remove_nans = self.get_parameter('remove_nans').get_parameter_value().bool_value
-        self.remove_infs = self.get_parameter('remove_infs').get_parameter_value().bool_value
-        self.crop_to_roi = self.get_parameter('crop_to_roi').value
-        self.crop_to_roi_invert = self.get_parameter('crop_to_roi.invert').value
-        self.roi_min = self.get_parameter('roi_min').value
-        self.roi_max = self.get_parameter('roi_max').value
-        self.voxel_size = self.get_parameter('voxel_size').value
-        self.remove_statistical_outliers = self.get_parameter('remove_statistical_outliers').value
-        self.remove_statistical_outliers_nb_neighbors = self.get_parameter('remove_statistical_outliers.nb_neighbors').get_parameter_value().integer_value
-        self.remove_statistical_outliers_std_ratio = self.get_parameter('remove_statistical_outliers.std_ratio').get_parameter_value().double_value
-        self.estimate_normals = self.get_parameter('estimate_normals').value
-        self.estimate_normals_search_radius = self.get_parameter('estimate_normals.search_radius').get_parameter_value().double_value
-        self.estimate_normals_max_neighbors = self.get_parameter('estimate_normals.max_neighbors').get_parameter_value().integer_value
-        self.remove_ground = self.get_parameter('remove_ground').value
-        self.remove_ground_distance_threshold = self.get_parameter('remove_ground.distance_threshold').get_parameter_value().double_value
-        self.remove_ground_ransac_number = self.get_parameter('remove_ground.ransac_number').get_parameter_value().integer_value
-        self.remove_ground_num_iterations = self.get_parameter('remove_ground.num_iterations').get_parameter_value().integer_value
-        self.remove_ground_probability = self.get_parameter('remove_ground.probability').get_parameter_value().double_value
-        self.ground_plane = self.get_parameter('ground_plane').value
-        self.use_height = self.get_parameter('use_height').value
-        self.override_header = self.get_parameter('override_header').value
+        self.remove_duplicates = self.get_parameter(f'{self.parameter_namespace}remove_duplicates').get_parameter_value().bool_value
+        self.remove_nans = self.get_parameter(f'{self.parameter_namespace}remove_nans').get_parameter_value().bool_value
+        self.remove_infs = self.get_parameter(f'{self.parameter_namespace}remove_infs').get_parameter_value().bool_value
+        self.crop_to_roi = self.get_parameter(f'{self.parameter_namespace}crop_to_roi').value
+        self.crop_to_roi_invert = self.get_parameter(f'{self.parameter_namespace}crop_to_roi.invert').value
+        self.roi_min = self.get_parameter(f'{self.parameter_namespace}roi_min').value
+        self.roi_max = self.get_parameter(f'{self.parameter_namespace}roi_max').value
+        self.voxel_size = self.get_parameter(f'{self.parameter_namespace}voxel_size').value
+        self.remove_statistical_outliers = self.get_parameter(f'{self.parameter_namespace}remove_statistical_outliers').value
+        self.remove_statistical_outliers_nb_neighbors = self.get_parameter(f'{self.parameter_namespace}remove_statistical_outliers.nb_neighbors').get_parameter_value().integer_value
+        self.remove_statistical_outliers_std_ratio = self.get_parameter(f'{self.parameter_namespace}remove_statistical_outliers.std_ratio').get_parameter_value().double_value
+        self.estimate_normals = self.get_parameter(f'{self.parameter_namespace}estimate_normals').value
+        self.estimate_normals_search_radius = self.get_parameter(f'{self.parameter_namespace}estimate_normals.search_radius').get_parameter_value().double_value
+        self.estimate_normals_max_neighbors = self.get_parameter(f'{self.parameter_namespace}estimate_normals.max_neighbors').get_parameter_value().integer_value
+        self.remove_ground = self.get_parameter(f'{self.parameter_namespace}remove_ground').value
+        self.remove_ground_distance_threshold = self.get_parameter(f'{self.parameter_namespace}remove_ground.distance_threshold').get_parameter_value().double_value
+        self.remove_ground_ransac_number = self.get_parameter(f'{self.parameter_namespace}remove_ground.ransac_number').get_parameter_value().integer_value
+        self.remove_ground_num_iterations = self.get_parameter(f'{self.parameter_namespace}remove_ground.num_iterations').get_parameter_value().integer_value
+        self.remove_ground_probability = self.get_parameter(f'{self.parameter_namespace}remove_ground.probability').get_parameter_value().double_value
+        self.ground_plane = self.get_parameter(f'{self.parameter_namespace}ground_plane').value
+        self.use_height = self.get_parameter(f'{self.parameter_namespace}use_height').value
+        self.override_header = self.get_parameter(f'{self.parameter_namespace}override_header').value
         if self.override_header:
             self.new_header_data = {
                 'frame_id': self.robot_frame,
-                'stamp_source': self.get_parameter('override_header.stamp_source').value
+                'stamp_source': self.get_parameter(f'{self.parameter_namespace}override_header.stamp_source').value
             }
-        self.visualize = self.get_parameter('visualize').value
+        self.visualize = self.get_parameter(f'{self.parameter_namespace}visualize').value
 
         # Setup the device
         self.torch_device = torch.device('cpu')
@@ -254,7 +263,12 @@ class PointcloudPreprocessorNode(Node):
             max_bound = o3c.Tensor(self.roi_max, dtype=o3c.Dtype.Float32)
             self.crop_aabb = o3d.t.geometry.AxisAlignedBoundingBox(min_bound, max_bound).to(self.o3d_device)
 
-        self.passthrough_filter = partial(crop_pointcloud, min_bound=self.roi_min, max_bound=self.roi_max,
+
+            # ##### todo: remove
+            sys.path = ['', '/opt/ros/humble/lib/python3.10/site-packages', '/opt/ros/humble/local/lib/python3.10/dist-packages', '/mnt/c/Users/boluo/OneDrive - Florida State University/Projects/autodriver/autodriver_perception', '/home/privvyledge/.local/bin', '/usr/lib/python310.zip', '/usr/lib/python3.10', '/usr/lib/python3.10/lib-dynload', '/home/privvyledge/python3_venvs/py310_venv/lib/python3.10/site-packages', '/home/privvyledge/GitRepos/GroundingDINO', '/home/privvyledge/python3_venvs/py310_venv/lib/python3.10/site-packages/pymesh2-0.3-py3.10-linux-x86_64.egg', '/home/privvyledge/GitRepos/mmdetection3d', '/home/privvyledge/GitRepos/mmyolo', '/home/privvyledge/python3_venvs/py310_venv/lib/python3.10/site-packages/autodistill_qwen_vl-0.1.0-py3.10.egg', '/home/privvyledge/GitRepos/mmdetection']
+            sys.path.extend(['/mnt/c/Users/boluo/OneDrive - Florida State University/Projects/autodriver/autodriver_perception/autodriver_pointcloud_preprocessor', '/mnt/c/Users/boluo/OneDrive - Florida State University/Projects/autodriver/autodriver_perception/autodriver_pointcloud_preprocessor/autodriver_pointcloud_preprocessor'])
+            # ##### todo: remove
+            self.passthrough_filter = partial(crop_pointcloud, min_bound=self.roi_min, max_bound=self.roi_max,
                                          invert=self.crop_to_roi_invert, aabb=self.crop_aabb)
         self.pointcloud_metadata = None
         self.pointfields, self.point_offset, self.new_dtype = None, None, None  # pointcloud fields and offset for numpy struct
@@ -278,20 +292,20 @@ class PointcloudPreprocessorNode(Node):
 
         # Setup Open3D visualization
         if self.visualize:
-            save_visualizer_image = bool(self.get_parameter('visualize.save_visualizer_image').value)
-            visualizer_image_path = str(self.get_parameter('visualize.visualizer_image_path').value)
+            save_visualizer_image = bool(self.get_parameter(f'{self.parameter_namespace}visualize.save_visualizer_image').value)
+            visualizer_image_path = str(self.get_parameter(f'{self.parameter_namespace}visualize.visualizer_image_path').value)
             if not visualizer_image_path:
                 visualizer_image_path = '.'  # os.getcwd()
             if save_visualizer_image and not os.path.exists(visualizer_image_path):
                 os.makedirs(visualizer_image_path, exist_ok=True)
             self.visualizer_options = {
-                'window_name': str(self.get_parameter('visualize.window_name').get_parameter_value().string_value),
-                'window_width': int(self.get_parameter('visualize.window_width').get_parameter_value().integer_value),
-                'window_height': int(self.get_parameter('visualize.window_height').get_parameter_value().integer_value),
-                'zoom': self.get_parameter('visualize.zoom').get_parameter_value().double_value,
-                'front': self.get_parameter('visualize.front').get_parameter_value().double_array_value,
-                'lookat': self.get_parameter('visualize.lookat').get_parameter_value().double_array_value,
-                'up': self.get_parameter('visualize.up').get_parameter_value().double_array_value,
+                'window_name': str(self.get_parameter(f'{self.parameter_namespace}visualize.window_name').get_parameter_value().string_value),
+                'window_width': int(self.get_parameter(f'{self.parameter_namespace}visualize.window_width').get_parameter_value().integer_value),
+                'window_height': int(self.get_parameter(f'{self.parameter_namespace}visualize.window_height').get_parameter_value().integer_value),
+                'zoom': self.get_parameter(f'{self.parameter_namespace}visualize.zoom').get_parameter_value().double_value,
+                'front': self.get_parameter(f'{self.parameter_namespace}visualize.front').get_parameter_value().double_array_value,
+                'lookat': self.get_parameter(f'{self.parameter_namespace}visualize.lookat').get_parameter_value().double_array_value,
+                'up': self.get_parameter(f'{self.parameter_namespace}visualize.up').get_parameter_value().double_array_value,
                 'save_visualizer_image': save_visualizer_image,
                 'visualizer_image_path': visualizer_image_path
             }
@@ -309,7 +323,8 @@ class PointcloudPreprocessorNode(Node):
             self.vis.add_geometry(self.o3d_pointcloud.to_legacy())
 
         # Setup subscribers
-        if enabled:
+        self.enabled = enabled
+        if self.enabled:
             # Setup dynamic parameter reconfiguring.
             # Register a callback function that will be called whenever there is an attempt to
             # change one or more parameters of the node.
@@ -626,6 +641,7 @@ class PointcloudPreprocessorNode(Node):
             self.get_logger().error(f"Error processing point cloud: {str(e)}")
 
     def get_camera_to_robot_tf(self, source_frame_id, timestamp=None):
+        # move to utils
         if self.camera_to_robot_tf is not None and self.static_camera_to_robot_tf:
             return
 
@@ -776,8 +792,6 @@ class PointcloudPreprocessorNode(Node):
 
     def parameter_change_callback(self, params):
         """
-        Todo:
-            * change topics (input/output) and destroy subscribers/publishers
         Triggered whenever there is a change request for one or more parameters.
 
         Args:
@@ -792,7 +806,18 @@ class PointcloudPreprocessorNode(Node):
 
         # Iterate over each parameter in this node
         for param in params:
-            if param.name == 'use_gpu' and param.type_ == Parameter.Type.BOOL:
+            if param.name == 'input_topic' and param.type_ == Parameter.Type.STRING:
+                self.poincloud_sub.destroy()
+                self.input_topic = param.value
+                self.poincloud_sub = self.create_subscription(PointCloud2, self.input_topic,
+                                                              self.callback, qos_profile=qos_profile)
+
+            elif param.name == 'output_topic' and param.type_ == Parameter.Type.STRING:
+                self.pointcloud_pub.destroy()
+                self.output_topic = param.value
+                self.pointcloud_pub = self.create_publisher(PointCloud2, self.output_topic, self.queue_size)
+
+            elif param.name == 'use_gpu' and param.type_ == Parameter.Type.BOOL:
                 # first set all to CPU
                 self.torch_device = torch.device('cpu')
                 self.o3d_device = o3d.core.Device('CPU:0')
@@ -911,7 +936,7 @@ class PointcloudPreprocessorNode(Node):
                 if self.override_header:
                     self.new_header_data = {
                         'frame_id': self.robot_frame,
-                        'stamp_source': self.get_parameter('override_header.stamp_source').value
+                        'stamp_source': self.get_parameter(f'{self.parameter_namespace}override_header.stamp_source').value
                     }
             elif param.name == 'override_header.stamp_source' and param.type_ == Parameter.Type.STRING:
                 self.new_header_data['stamp_source'] = param.value
