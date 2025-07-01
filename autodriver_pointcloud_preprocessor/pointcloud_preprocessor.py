@@ -24,7 +24,7 @@ Todo:
     * optimize ROS <--> Open3D extraction, i.e PointCloud from dictionary (and test with GPU) [done]
     * Add parameters for all preprocessing functions and make them modular to be used in composable nodes [done]
     * use "partial" from functools [done]
-    * test changing input/output pointcloud topics
+    * test changing input/output pointcloud topics [done]
     * add separate parameters for ROI cropping
     * initialize the timing dict once then print if debug
     * add numpy and torch based nan and infinite point removal (https://github.com/SeungBack/open3d-ros-helper/blob/master/open3d_ros_helper/open3d_ros_helper.py#L262)
