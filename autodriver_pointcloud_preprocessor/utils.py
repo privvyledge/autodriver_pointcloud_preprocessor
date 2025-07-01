@@ -433,7 +433,9 @@ def structured_numpy_array_to_open3d_tensor_pointcloud(structured_numpy_array):
 
 def remove_duplicates(pointcloud, backend='torch'):
     """
-    Todo: check pointcloud instance first, i.e Open3D.t.geometry.PointCloud, numpy, torch then convert
+    Todo:
+        * check pointcloud instance first, i.e Open3D.t.geometry.PointCloud, numpy, torch then convert
+        * implement for loop to remove duplicates without sorting since numpy and torch unique sorts by default regardless of sorted=False
     :param pointcloud: Open3D.t.geometry.PointCloud object
     :param backend:
     :return:
@@ -453,14 +455,14 @@ def remove_duplicates(pointcloud, backend='torch'):
 
         # use numpy operations since they can be significantly faster than Open3D on CPU
         np_pointcloud, duplicates_indices = np.unique(points,
-                                                      axis=0, return_index=True)
+                                                      axis=0, return_index=True, sorted=False)
         pointcloud = pointcloud.select_by_index(o3c.Tensor.from_numpy(duplicates_indices).to(pointcloud.device))
     elif backend.lower() in ['torch', 'pytorch']:
         # torch alternative. Fastest by default
         points = torch_from_dlpack(pointcloud.point.positions.to_dlpack())
         torch_pointcloud, duplicates_indices = torch.unique(
-                points, dim=0, sorted=False,
-                return_inverse=True)  # torch.unique is slower due to sorting but unique_consecutive is does not remove all duplicates only consecutive ones.
+                points, dim=0, return_inverse=True,
+                sorted=False)  # torch.unique is slower due to sorting but unique_consecutive is does not remove all duplicates only consecutive ones.
         pointcloud = pointcloud.select_by_index(
                 o3c.Tensor.from_dlpack(torch_to_dlpack(duplicates_indices)))
     else:
