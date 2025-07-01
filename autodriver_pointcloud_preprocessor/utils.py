@@ -459,7 +459,7 @@ def remove_duplicates(pointcloud, backend='torch'):
         # torch alternative. Fastest by default
         points = torch_from_dlpack(pointcloud.point.positions.to_dlpack())
         torch_pointcloud, duplicates_indices = torch.unique(
-                points, dim=0,
+                points, dim=0, sorted=False,
                 return_inverse=True)  # torch.unique is slower due to sorting but unique_consecutive is does not remove all duplicates only consecutive ones.
         pointcloud = pointcloud.select_by_index(
                 o3c.Tensor.from_dlpack(torch_to_dlpack(duplicates_indices)))
