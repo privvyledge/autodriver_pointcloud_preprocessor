@@ -1,10 +1,4 @@
 """
-Todo:
-    * ros pointcloud to dict (convert_pointcloud_to_numpy) [done]
-    * dict to open3d (Open3D accepts initialization from dict so just profile). https://www.open3d.org/docs/release/tutorial/t_geometry/pointcloud.html#PointCloud-creation [done]
-    * ros pointcloud to open3d pointcloud [done]
-    * finalize cropping function [done]
-    * handle individual R, G, B or combined  (https://docs.ros.org/en/jade/api/ros_numpy/html/namespaceros__numpy_1_1point__cloud2.html#a83fe725ae892944ced7d5283d5e1c643)
 """
 import time
 from typing import Any
@@ -44,22 +38,30 @@ FIELD_DTYPE_MAP = {
 
 FIELD_DTYPE_MAP_INV = {v: k for k, v in FIELD_DTYPE_MAP.items()}
 
+VENDOR_MAPPINGS = {
+            "intensity": ["I", "intensity"],
+            "ring": ["C", "ring", "line"],  # Autoware, Velodyne, Livox
+            "time": ["t", "time", "timestamp"],  # , Autoware/velodyne, Livox
+            "return_type": ["return_type", "tag", "R"],  # Velodyne, Livox, Autoware
+            "azimuth": ["azimuth"],
+            "distance": ["distance", "depth", "d"],
+        }
 
-def convert_pointcloud_to_numpy(structured_cloud_array, cloud_field_names=None, num_fields=None, field_names=None):
-    # todo: handle different field names from different vendors
-    # todo: unpack to Open3D tensor directly
-    if cloud_field_names is None:
-        cloud_field_names = structured_cloud_array.dtype.names
 
-    if num_fields is None:
-        num_fields = len(cloud_field_names)
+def convert_pointcloud_to_numpy(structured_cloud_array, metadata_dict):
+    has_rgb = metadata_dict.get('has_rgb', False)
+    has_intensity = metadata_dict.get('has_intensity', False)
+    has_ring = metadata_dict.get('has_ring', False)
+    has_time = metadata_dict.get('has_time', False)
+    has_return_type = metadata_dict.get('has_return_type', False)
 
-    # Optional: Extract additional attributes if present. todo: pass in pointcloud_metadata and just use keys instead of querying
-    has_rgb = "rgb" in cloud_field_names
-    has_intensity = "intensity" in cloud_field_names
-    has_ring = "ring" in cloud_field_names
-    has_time = "time" in cloud_field_names
-    has_return_type = "return_type" in cloud_field_names
+    intensity_field_name = metadata_dict.get('intensity_field_name', None)
+    ring_field_name = metadata_dict.get('ring_field_name', None)
+    time_field_name = metadata_dict.get('time_field_name', None)
+    return_type_field_name = metadata_dict.get('return_type_field_name', None)
+
+    field_names = metadata_dict.get('field_names', ['x', 'y', 'z'])
+    num_fields = metadata_dict.get('num_fields', -1)
 
     """
     positions = []
@@ -100,25 +102,32 @@ def convert_pointcloud_to_numpy(structured_cloud_array, cloud_field_names=None, 
     positions_arr = np.vstack(
         (structured_cloud_array["x"], structured_cloud_array["y"], structured_cloud_array["z"])
     ).T.astype(np.float32)
-    rgb_arr = structured_cloud_array["rgb"].astype(np.float32) if has_rgb else None
-    intensity_arr = structured_cloud_array["intensity"].astype(np.float32) if has_intensity else None
-    ring_arr = structured_cloud_array["ring"].astype(np.uint16) if has_ring else None
-    time_arr = structured_cloud_array["time"].astype(np.float64) if has_time else None
-    return_type_arr = structured_cloud_array["return_type"].astype(np.uint8) if has_return_type else None
 
     pointcloud_dictionary = {
         'positions': positions_arr,
     }
 
     if has_rgb:
+        if {"r", "g", "b"}.issubset(field_names):
+            # separate 'r', 'g', 'b' bytes and fields in cloud_field_names
+            rgb_arr = merge_rgb_fields(structured_cloud_array["r"],
+                                       structured_cloud_array["g"],
+                                       structured_cloud_array["b"], return_int=True)
+        else:
+            # packed 'rgb' bytes and fields in cloud_field_names. The input can be from above if return_int=Fasle
+            rgb_arr = extract_rgb_from_pointcloud(structured_cloud_array["rgb"].astype(np.float32))
         pointcloud_dictionary['rgb'] = rgb_arr
     if has_intensity:
+        intensity_arr = structured_cloud_array[intensity_field_name].astype(np.float32)
         pointcloud_dictionary['intensity'] = intensity_arr
     if has_ring:
+        ring_arr = structured_cloud_array[ring_field_name].astype(np.uint16)
         pointcloud_dictionary['ring'] = ring_arr
     if has_time:
+        time_arr = structured_cloud_array[time_field_name].astype(np.float64)
         pointcloud_dictionary['time'] = time_arr
     if has_return_type:
+        return_type_arr = structured_cloud_array[return_type_field_name].astype(np.uint8)
         pointcloud_dictionary['return_type'] = return_type_arr
 
     return pointcloud_dictionary
@@ -190,19 +199,27 @@ def numpy_struct_to_pointcloud2(field_names: list,
     return fields, offset
 
 
-def pointcloud_to_dict(ros_cloud, field_names=None, skip_nans=True, organize_cloud=False):
-    metadata_dict = {'header': ros_cloud.header, 'field_names': None}
+def pointcloud_to_dict(ros_cloud, field_names=None, skip_nans=True, organize_cloud=False, metadata_dict=None):
+    if not metadata_dict:
+        metadata_dict = {}
+    metadata_dict.update({'header': ros_cloud.header, 'field_names': None})
     cloud_array = point_cloud2.read_points(
         ros_cloud,
         field_names=field_names,
         skip_nans=skip_nans,
         reshape_organized_cloud=organize_cloud
     )
-    cloud_dict = {'cloud_array': cloud_array}
+    cloud_dict = dict()
     metadata_dict['field_names'] = cloud_array.dtype.names  # the field names extracted
     metadata_dict['num_fields'] = len(metadata_dict['field_names'])
+
+    # Optional: Extract additional attributes if present.
+    if not metadata_dict.get('has_intensity', False):
+        field_mapping_dict = get_pointcloud_metadata(metadata_dict['field_names'])
+        metadata_dict.update(field_mapping_dict)
+
     cloud_dict.update(
-        convert_pointcloud_to_numpy(cloud_dict['cloud_array'], metadata_dict['field_names'], metadata_dict['num_fields']))
+        convert_pointcloud_to_numpy(cloud_array, metadata_dict))
     return cloud_dict, metadata_dict
 
 
@@ -284,18 +301,42 @@ def crop_pointcloud(pointcloud, backend='open3d', min_bound=None, max_bound=None
     return pointcloud, msg
 
 
+def merge_rgb_fields(r, g, b, return_int=False):
+    """
+    Takes separate r, g, b fields of type np.uint8 and returns a merged rgb array of type np.float32 or np.uint8.
+    PCL typically outputs separate r, g, b fields.
+    Source: https://docs.ros.org/en/kinetic/api/ros_numpy/html/namespaceros__numpy_1_1point__cloud2.html#af3d3551aaadd53513bb382aa8092fe4b
+    """
+    if return_int:
+        r = r.astype(np.uint8)  # np.asarray(cloud_arr['r'], dtype=np.uint8)
+        g = g.astype(np.uint8)
+        b = b.astype(np.uint8)
+        rgb_arr = np.vstack((r, g, b)).T
+    else:
+        r = r.astype(np.uint32)  # np.asarray(cloud_arr['r'], dtype=np.uint32)
+        g = g.astype(np.uint32)
+        b = b.astype(np.uint32)
+        # todo: test setting dtype=np.float32 vs using astype vs .view(np.float32)
+        rgb_arr = np.array((r << 16) | (g << 8) | (b << 0)).view(np.float32)
+
+    return rgb_arr
+
 def extract_rgb_from_pointcloud(rgb):
-    # todo: support splitting joined rgb and packing separate R, G, B
+    """
+    Extracts a packed 'rgb' float32 array/field and returns an RGB array of type uint8.
+    """
     # Many ROS drivers, such as RealSense and Zed pack RGB as a float32 where bytes are [R,G,B,0].
     # We reinterpret the float as a uint32, then bit-shift.
     rgb_floats = rgb  # self.pointcloud_dictionary['cloud_array']["rgb"].astype(np.float32)
-    rgb_bytes = rgb_floats.view(np.uint32)
+    rgb_bytes = rgb_floats.view(np.uint32)  # rgb_floats.dtype = np.uint32
     # Extract RGB channels
-    r = ((rgb_bytes >> 16) & 0xFF).astype(np.uint8)
+    r = ((rgb_bytes >> 16) & 0xFF).astype(np.uint8)  # np.asarray((rgb_arr >> 16) & 255, dtype=np.uint8)
     g = ((rgb_bytes >> 8) & 0xFF).astype(np.uint8)
     b = (rgb_bytes & 0xFF).astype(np.uint8)
 
     # Stack RGB channels
+    # rgb_arr = np.zeros(rgb_floats.shape, dtype=np.uint8)  # todo: use zeros and replace
+    # rgb_array[:, :] = r, g, b
     rgb_arr = np.vstack((r, g, b)).T.astype(np.uint8)
 
     # r = ((rgb_bytes >> 16) & 0xFF).astype(np.float32) / 255.0
@@ -379,22 +420,56 @@ def intensity_to_rgb(intensity):
     color = o3d.core.Tensor(rgb)  # todo: get device from intensity or just use Open3D/Torch operations
     return color
 
-def get_pointcloud_metadata(field_names):
-    # todo: add support for differing names
-    has_rgb = "rgb" in field_names
-    has_intensity = "intensity" in field_names
-    has_ring = "ring" in field_names
-    has_time = "time" in field_names
-    has_return_type = "return_type" in field_names
+def parse_differing_fields(options, field_names):
+    """
+    Takes in either a list of options or an option and checks if it exists in the field_names.
+    Used to handle different field names from various LIDAR vendors/manufacturers/drivers.
+    """
+    if isinstance(options, str):
+        options = [options]
+
+    # return any(option.lower() in field_names for option in options), None
+    option_in_field_names = []
+    corresponding_field_name = None
+    for option in options:
+        if option.lower() in field_names:
+            option_in_field_names.append(option)
+            corresponding_field_name = option
+    return any(option_in_field_names), corresponding_field_name
+
+
+def get_pointcloud_metadata(field_names, vendor_mappings: dict =None):
+    # todo: rethink and refactor the logic here and parse_differing_fields
+    # todo: could split corresponding field name mapping to dictionary
+    # Todo: let the user add custom options, vendor mappings and pointcloud_metadata keys
+    # todo: add support for all field_names, i.e parse the non-standard keys
+    if vendor_mappings is None:
+        vendor_mappings = VENDOR_MAPPINGS
+    field_names = [field_name.lower() for field_name in field_names]
+
+    if {"r", "g", "b"}.issubset(field_names):
+        has_rgb = True  # separate fields per channel
+        rgb_field_name = ['r', 'g', 'b']
+    else:
+        has_rgb, rgb_field_name = parse_differing_fields("rgb", field_names)   # r, g, b or rgb
+
+    has_intensity, intensity_field_name = parse_differing_fields(vendor_mappings["intensity"], field_names)
+    has_ring, ring_field_name = parse_differing_fields(vendor_mappings["ring"], field_names)
+    has_time, time_field_name = parse_differing_fields(vendor_mappings["time"], field_names)
+    has_return_type, return_type_field_name = parse_differing_fields(vendor_mappings["return_type"], field_names)
+
     pointcloud_metadata = {
         'has_rgb': has_rgb,
         'has_intensity': has_intensity,
+        'intensity_field_name': intensity_field_name,
         'has_ring': has_ring,
+        'ring_field_name': ring_field_name,
         'has_time': has_time,
-        'has_return_type': has_return_type
+        'time_field_name': time_field_name,
+        'has_return_type': has_return_type,
+        'return_type_field_name': return_type_field_name,
     }
     return pointcloud_metadata
-
 
 def get_current_time(monotonic=True):
     """

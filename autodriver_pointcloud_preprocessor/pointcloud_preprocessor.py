@@ -24,13 +24,14 @@ Todo:
     * optimize ROS <--> Open3D extraction, i.e PointCloud from dictionary (and test with GPU) [done]
     * Add parameters for all preprocessing functions and make them modular to be used in composable nodes [done]
     * use "partial" from functools [done]
-    * test changing input/output pointcloud topics [done]
-    * add separate parameters for ROI cropping
+    * test changing input/output pointcloud topics [done: destruction does not work due to rclpy issues but creating/changing new subsciption/creation works]
+    * Optimize different names/fields from different vendors and unify in a dictionary [done]
+    * test pointcloud transformation to different frames (do this with the US DOT dataset) [done]
+    * add ability to offset the pointcloud (in the lidar frame). This should work even if robot_frame is None [done]
     * initialize the timing dict once then print if debug
     * add numpy and torch based nan and infinite point removal (https://github.com/SeungBack/open3d-ros-helper/blob/master/open3d_ros_helper/open3d_ros_helper.py#L262)
     * replace infinite/nan removal with numpy and torch native operations
     * Compare my cropping function with (https://github.com/SeungBack/open3d-ros-helper/blob/master/open3d_ros_helper/open3d_ros_helper.py#L385)
-    * test pointcloud transformation to different frames (do this with the US DOT dataset)
     * move transformation functions (get_camera_to_robot_tf, transform_to_matrix) to utils
     * add namespace to "declare_parameters"
     * add other preprocessing steps such as furthest point downsampling, uniform downsampling, random downsampling, radius outlier removal, etc.
@@ -43,20 +44,46 @@ Todo:
         * Use tensordict to copy to torch tensors at once instead of Open3D tensors then use dlpack to transfer ownership of each tensor (https://github.com/pytorch/tensordict/blob/main/GETTING_STARTED.md | https://github.com/pytorch/tensordict)
         * Compare Torch tensordicts to open3d tensors
     * switch to self.get_parameters_by_prefix(prefix) and set prefix to parameter namespace instead of self.get_parameter(f'{parameter_namespace}
-    * Optimize different names/fields from different vendors and unify in a dictionary
     * add onetime height/ground estimation from my autodriving transformer code
     * Create a Python "package" for standalone non-ROS use then just import that here
     * make torch an optional dependency, i.e. only use it if the user has it installed. Device checks for Open3D do not need torch.
     * Remove Todo comments and add to package description/features
+    * optimize for performance
 """
 import os
 import sys
 import pathlib  # avoid importing Path to avoid clashes with nav2_msgs/msg/Path.py
-from functools import partial
-
 import time
 import struct
 from typing import Any
+from copy import copy, deepcopy
+from functools import partial
+
+import numpy as np
+np.set_printoptions(suppress=True)
+
+try:
+    import scipy
+    from scipy.spatial.transform import Rotation as R
+    SCIPY_INSTALLED = True
+    SCIPY_VERSION = scipy.__version__
+except ImportError:
+    SCIPY_INSTALLED = False
+    SCIPY_VERSION = '0.0.0'
+
+try:
+    import tf_transformations
+    from tf_transformations import quaternion_matrix, quaternion_from_matrix
+    TF_TRANSFORMATIONS_INSTALLED = True
+except ImportError:
+    TF_TRANSFORMATIONS_INSTALLED = False
+
+from cv_bridge import CvBridge
+import cv2
+import torch
+import torch.utils.dlpack
+import open3d as o3d
+import open3d.core as o3c
 
 import rclpy
 from rclpy.node import Node
@@ -76,16 +103,7 @@ from message_filters import Subscriber, ApproximateTimeSynchronizer
 import tf2_ros
 from tf2_ros import TransformBroadcaster, TransformListener, Buffer, LookupException, ConnectivityException, \
     ExtrapolationException
-import tf_transformations
-import numpy as np
-import transforms3d
-from tf_transformations import quaternion_matrix, quaternion_from_matrix
-from cv_bridge import CvBridge
-import cv2
-import torch
-import torch.utils.dlpack
-import open3d as o3d
-import open3d.core as o3c
+
 
 # from utils import ...
 from autodriver_pointcloud_preprocessor.utils import (convert_pointcloud_to_numpy, numpy_struct_to_pointcloud2,
@@ -95,7 +113,7 @@ from autodriver_pointcloud_preprocessor.utils import (convert_pointcloud_to_nump
                                                       check_field, crop_pointcloud,
                                                       extract_rgb_from_pointcloud, get_fields_from_dicts,
                                                       remove_duplicates, rgb_int_to_float,
-                                                      FIELD_DTYPE_MAP, FIELD_DTYPE_MAP_INV)
+                                                      FIELD_DTYPE_MAP, FIELD_DTYPE_MAP_INV, VENDOR_MAPPINGS)
 
 
 
@@ -122,12 +140,20 @@ class PointcloudPreprocessorNode(Node):
             type=ParameterType.PARAMETER_STRING))
         self.declare_parameter(f'{self.parameter_namespace}pointcloud_fields', [])
         self.declare_parameter(f'{self.parameter_namespace}queue_size', 1)
-        self.declare_parameter(f'{self.parameter_namespace}use_gpu', True)
+        self.declare_parameter(f'{self.parameter_namespace}use_gpu', False)
         self.declare_parameter(f'{self.parameter_namespace}cpu_backend', 'torch')  # numpy, pytorch or open3d
         self.declare_parameter(f'{self.parameter_namespace}gpu_backend', 'open3d')  # pytorch or open3d
         self.declare_parameter(f'{self.parameter_namespace}robot_frame', '')
         self.declare_parameter(f'{self.parameter_namespace}static_camera_to_robot_tf', True)
         self.declare_parameter(f'{self.parameter_namespace}transform_timeout', 0.1)
+        # offset_pointcloud_matrix = np.eye(4, 4, dtype=np.float32)
+        # offset_pointcloud_matrix[:3, 3] = [10, 0, -10]
+        # offset_pointcloud_matrix[:3, :3]  = R.from_euler('zyx', [180, 0., 0.], degrees=True).as_matrix()  # np.eye(4, 4, dtype=np.float32).flatten().tolist()
+        # offset_pointcloud_matrix = offset_pointcloud_matrix.flatten().tolist()
+        # create a list corresponding to a 4x4 identity matrix
+        offset_pointcloud_matrix = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        self.declare_parameter(f'{self.parameter_namespace}offset_pointcloud_matrix', offset_pointcloud_matrix)  # [0.0] * 16
+        self.declare_parameter(f'{self.parameter_namespace}offset_pointcloud_frame', '')  # '', lidar, robot
         self.declare_parameter(f'{self.parameter_namespace}organize_cloud', False)
         self.declare_parameter(f'{self.parameter_namespace}save_pointcloud', False)
         self.declare_parameter(f'{self.parameter_namespace}pointcloud_save_directory', './pointclouds/')
@@ -173,7 +199,7 @@ class PointcloudPreprocessorNode(Node):
         self.declare_parameter(f'{self.parameter_namespace}visualize.visualizer_image_path', './images')
 
         # Get parameters.
-        # # # todo: self.get_parameters_by_prefix(prefix=self.parameter_namespace.rstrip('.')) returns a dictionary of parameters so will need to be called once then other parameters will be keys in the dictionary
+        # # # todo: self.get_parameters_by_prefix(prefix=self.parameter_namespace.rstrip('.')) returns a dictionary of parameters so will need to be called once then other parameters will be keys in the dictionary  including use_sim_time. No need for the extra attributes if using the dictionary.
         # # # ######################
         # self.parameters = self.get_parameters_by_prefix(prefix=self.parameter_namespace.rstrip('.'))
         # self.use_sim_time = self.parameters.get('use_sim_time').get_parameter_value().bool_value
@@ -194,8 +220,13 @@ class PointcloudPreprocessorNode(Node):
         self.cpu_backend = self.get_parameter(f'{self.parameter_namespace}cpu_backend').value
         self.gpu_backend = self.get_parameter(f'{self.parameter_namespace}gpu_backend').value
         self.robot_frame = self.get_parameter(f'{self.parameter_namespace}robot_frame').value
+        if self.robot_frame:
+            assert SCIPY_INSTALLED or TF_TRANSFORMATIONS_INSTALLED
+            self.rotation_object = None
+            self.homogenous_matrix = np.eye(4)
         self.static_camera_to_robot_tf = self.get_parameter(f'{self.parameter_namespace}static_camera_to_robot_tf').value
         self.transform_timeout = self.get_parameter(f'{self.parameter_namespace}transform_timeout').value
+        self.offset_pointcloud_frame = self.get_parameter(f'{self.parameter_namespace}offset_pointcloud_frame').value
         self.organize_cloud = self.get_parameter(f'{self.parameter_namespace}organize_cloud').value
         self.save_pointcloud = self.get_parameter(f'{self.parameter_namespace}save_pointcloud').value
         self.pointcloud_save_directory = self.get_parameter(f'{self.parameter_namespace}pointcloud_save_directory').value
@@ -247,6 +278,13 @@ class PointcloudPreprocessorNode(Node):
                 self.o3d_device = o3d.core.Device('CUDA:0')
             else:
                 self.use_gpu = False
+
+        self.offset_pointcloud_matrix = self.get_parameter(f'{self.parameter_namespace}offset_pointcloud_matrix').value
+        self.offset_pointcloud_matrix = np.array(self.offset_pointcloud_matrix).reshape(4, 4)
+        if np.allclose(self.offset_pointcloud_matrix, np.eye(4)):
+            self.offset_pointcloud_matrix = None
+        else:
+            self.offset_pointcloud_matrix = o3c.Tensor(self.offset_pointcloud_matrix, dtype=o3c.float32, device=self.o3d_device)
 
         # Initialize variables
         self.camera_to_robot_tf = None
@@ -341,6 +379,14 @@ class PointcloudPreprocessorNode(Node):
             # Setup publishers
             self.pointcloud_pub = self.create_publisher(PointCloud2, self.output_topic, self.queue_size)
 
+            # # Setup a timer to handle changing subscribed/published topics since rclpy.spin will error out due to race conditions
+            # try:
+            #     self._reset_timer = self.create_timer(0.1, self.reset_callback, autostart=False)
+            # except TypeError:
+            #     # ROS2 Humble and earlier do not support autostart argument
+            #     self._reset_timer = self.create_timer(0.1, self.reset_callback)
+            #     self._reset_timer.cancel()
+
             # self.pointcloud_timer = self.create_timer(1 / self.odom_rate, self.rgbd_timer_callback)
             self.get_logger().info(f"{self.get_fully_qualified_name()} node started on device: {self.o3d_device}")
 
@@ -349,14 +395,9 @@ class PointcloudPreprocessorNode(Node):
         try:
             start_time = get_current_time(monotonic=True)
             field_names = self.pointcloud_fields if self.pointcloud_fields else None  # ('x', 'y', 'z', 'rgb'),
-            self.pointcloud_dictionary, pointcloud_metadata = pointcloud_to_dict(
-                    ros_cloud, field_names, self.remove_nans, self.organize_cloud)
+            self.pointcloud_dictionary, self.pointcloud_metadata = pointcloud_to_dict(
+                    ros_cloud, field_names, self.remove_nans, self.organize_cloud, self.pointcloud_metadata)
 
-            if self.pointcloud_metadata is None:
-                # Optional: Extract additional attributes if present
-                self.pointcloud_metadata = get_pointcloud_metadata(pointcloud_metadata['field_names'])
-
-            self.pointcloud_metadata.update(pointcloud_metadata)
             cloud_field_names = self.pointcloud_metadata.get('field_names', None)
             num_fields = self.pointcloud_metadata['num_fields']
 
@@ -364,11 +405,9 @@ class PointcloudPreprocessorNode(Node):
             self.get_logger().error(f"Failed to convert PointCloud2 message to numpy: {str(e)}")
             return None
 
-        if self.pointcloud_dictionary['cloud_array'].size == 0:
+        if self.pointcloud_dictionary['positions'].size == 0:
             self.get_logger().warn("Received an empty PointCloud. Skipping...")
             return None
-
-        self.pointcloud_dictionary.pop('cloud_array')
 
         # test if x, y, and z are present
         if not {"x", "y", "z"}.issubset(cloud_field_names):
@@ -376,17 +415,6 @@ class PointcloudPreprocessorNode(Node):
             return None
 
         self.processing_times['ros_to_numpy'] = get_time_difference(start_time, get_current_time(monotonic=True))
-
-        # Extract XYZ points
-        start_time = get_current_time(monotonic=True)
-
-        # Extract and convert RGB values
-        if 'rgb' in cloud_field_names and self.pointcloud_metadata['has_rgb']:
-            rgb_arr = extract_rgb_from_pointcloud(self.pointcloud_dictionary['rgb'])
-        else:
-            rgb_arr = None
-
-        self.processing_times['data_preparation'] = get_time_difference(start_time, get_current_time(monotonic=True))
 
         # Clear previous point and attributes
         start_time = get_current_time(monotonic=True)
@@ -397,11 +425,12 @@ class PointcloudPreprocessorNode(Node):
         start_time = get_current_time(monotonic=True)
         self.pointcloud_dictionary['positions'] = o3c.Tensor.from_numpy(self.pointcloud_dictionary['positions'])
 
-        if rgb_arr is not None:
-            rgb_f = rgb_arr.astype(np.float32) / 255.0
-            if check_field('rgb'):
+        if self.pointcloud_metadata.get('has_rgb'):
+            rgb_f = self.pointcloud_dictionary['rgb'].astype(np.float32) / 255.0
+            if check_field('rgb', self.pointcloud_dictionary, self.pointcloud_metadata):
                 self.pointcloud_dictionary['rgb'] = o3c.Tensor.from_numpy(rgb_f)
 
+        # todo: loop through self.pointcloud_metadata['field_names'] to get the key to check for
         self.pointcloud_dictionary = get_fields_from_dicts('intensity', self.pointcloud_dictionary,
                                                            self.pointcloud_metadata)
         self.pointcloud_dictionary = get_fields_from_dicts('ring', self.pointcloud_dictionary,
@@ -416,6 +445,7 @@ class PointcloudPreprocessorNode(Node):
         return None
 
     def preprocess(self):
+        # todo: move to utils
         # Remove duplicate points.
         if self.remove_duplicates:
             start_time = get_current_time(monotonic=True)
@@ -447,10 +477,17 @@ class PointcloudPreprocessorNode(Node):
                                     rclpy.time.Time().from_msg(self.pointcloud_metadata["header"].stamp))
         self.processing_times['tf_lookup'] = get_time_difference(start_time, get_current_time(monotonic=True))
 
+        # offset the pointcloud in the lidar frame
+        if self.offset_pointcloud_matrix is not None and self.offset_pointcloud_frame.lower() in ['', 'lidar']:
+            self.o3d_pointcloud.transform(self.offset_pointcloud_matrix)
+
         if self.camera_to_robot_tf is not None:
             start_time = get_current_time(monotonic=True)
-            self.o3d_pointcloud = self.o3d_pointcloud.transform(self.camera_to_robot_tf)
-            frame_id = self.robot_frame
+            # transform the pointcloud in place. To keep the original use: o3d_pcd_copy = self.o3d_pointcloud.clone()
+            self.o3d_pointcloud.transform(self.camera_to_robot_tf)
+            # offset the pointcloud in the robot frame
+            if self.offset_pointcloud_matrix is not None and self.offset_pointcloud_frame.lower() in 'robot':
+                self.o3d_pointcloud.transform(self.offset_pointcloud_matrix)
             self.processing_times['transform'] = get_time_difference(start_time, get_current_time(monotonic=True))
 
         # ROI cropping
@@ -536,8 +573,19 @@ class PointcloudPreprocessorNode(Node):
                 is_dense=self.remove_nans and self.remove_infs
         )
 
-    def prepare_pointcloud(self, ros_cloud):
-        processed_positions = self.o3d_pointcloud.point.positions.cpu().numpy()
+    def prepare_pointcloud(self, ros_cloud, o3d_pointcloud=None, pointcloud_metadata=None):
+        if o3d_pointcloud is None:
+            o3d_pointcloud = self.o3d_pointcloud
+
+        if not pointcloud_metadata:
+            pointcloud_metadata = self.pointcloud_metadata
+
+        intensity_field_name = pointcloud_metadata.get('intensity_field_name', None)
+        ring_field_name = pointcloud_metadata.get('ring_field_name', None)
+        time_field_name = pointcloud_metadata.get('time_field_name', None)
+        return_type_field_name = pointcloud_metadata.get('return_type_field_name', None)
+
+        processed_positions = o3d_pointcloud.point.positions.cpu().numpy()
         num_points = processed_positions.shape[0]
         if self.pointfields is None or self.reset_fields:
             self.set_fields(ros_cloud)
@@ -548,40 +596,47 @@ class PointcloudPreprocessorNode(Node):
         processed_struct["z"] = processed_positions[:, 2]
 
         # Handle other fields.
-        rgb_np = self.copy_fields('rgb', self.o3d_pointcloud)
+        rgb_np = self.copy_fields('rgb', o3d_pointcloud)
         if rgb_np:
             rgb_float32 = rgb_int_to_float(rgb_np)
             processed_struct["rgb"] = rgb_float32
 
         if check_field('intensity', self.pointcloud_dictionary, self.pointcloud_metadata):
-            intensity_np = self.copy_fields('intensity', self.o3d_pointcloud)
-            processed_struct["intensity"] = intensity_np.astype(processed_struct["intensity"].dtype)
+            intensity_np = self.copy_fields('intensity', o3d_pointcloud)
+            processed_struct[intensity_field_name] = intensity_np.astype(processed_struct[intensity_field_name].dtype)
 
         if check_field('ring', self.pointcloud_dictionary, self.pointcloud_metadata):
-            ring_np = self.copy_fields('ring', self.o3d_pointcloud)
-            processed_struct["ring"] = ring_np.astype(processed_struct["ring"].dtype)
+            ring_np = self.copy_fields('ring', o3d_pointcloud)
+            processed_struct[ring_field_name] = ring_np.astype(processed_struct[ring_field_name].dtype)
 
         if check_field('time', self.pointcloud_dictionary, self.pointcloud_metadata):
-            time_np = self.copy_fields('time', self.o3d_pointcloud)
-            processed_struct["time"] = time_np.astype(processed_struct["time"].dtype)
+            time_np = self.copy_fields('time', o3d_pointcloud)
+            processed_struct[time_field_name] = time_np.astype(processed_struct[time_field_name].dtype)
+
+        if check_field('return_type', self.pointcloud_dictionary, self.pointcloud_metadata):
+            return_type_np = self.copy_fields('return_type', o3d_pointcloud)
+            processed_struct[return_type_field_name] = return_type_np.astype(processed_struct[return_type_field_name].dtype)
 
         if self.estimate_normals or self.pointcloud_metadata.get('has_normals', False):
-            normals_np = self.o3d_pointcloud.point.normals.cpu().numpy()
+            normals_np = o3d_pointcloud.point.normals.cpu().numpy()
             processed_struct["normal_x"] = normals_np[:, 0].astype(processed_struct["normal_x"].dtype)  # normal_* or n*
             processed_struct["normal_y"] = normals_np[:, 1].astype(processed_struct["normal_y"].dtype)  # normal_* or n*
             processed_struct["normal_z"] = normals_np[:, 2].astype(processed_struct["normal_z"].dtype)  # normal_* or n*
         return processed_struct
 
 
-    def create_header(self, ros_cloud):
+    def create_header(self, ros_cloud, frame_id=None):
         new_header = ros_cloud.header
+        if frame_id is None:
+            # override frame_id with robot frame if transformation is done
+            pointcloud_frame_id = ros_cloud.header.frame_id  # self.pointcloud_metadata.get('header').frame_id
+            if (self.camera_to_robot_tf is not None) and self.robot_frame and (self.robot_frame != pointcloud_frame_id):
+                new_header.frame_id = self.robot_frame
+
         if self.override_header:
             if self.new_header_data['stamp_source'].lower() == 'latest':
                 # latest gets the most recent time
                 new_header.stamp = self.get_clock().now().to_msg()
-
-            if self.new_header_data['frame_id'].lower():
-                new_header.frame_id = self.new_header_data['frame_id']
 
         return new_header
 
@@ -608,7 +663,7 @@ class PointcloudPreprocessorNode(Node):
             # Create PointCloud2 message.
             new_header = self.create_header(ros_cloud)
             pc_msg = self.tensor_to_ros_cloud(processed_struct, self.pointfields, header=new_header)
-            pc_msg.is_dense = self.remove_nans and self.remove_infs
+            pc_msg.is_dense = ros_cloud.is_dense and self.remove_nans and self.remove_infs
             self.processing_times['pointcloud_msg_parsing'] = get_time_difference(start_time, get_current_time(monotonic=True))
 
             start_time = get_current_time(monotonic=True)
@@ -647,7 +702,7 @@ class PointcloudPreprocessorNode(Node):
             self.get_logger().error(f"Error processing point cloud: {str(e)}")
 
     def get_camera_to_robot_tf(self, source_frame_id, timestamp=None):
-        # move to utils
+        # todo: move to utils
         if self.camera_to_robot_tf is not None and self.static_camera_to_robot_tf:
             return
 
@@ -677,70 +732,32 @@ class PointcloudPreprocessorNode(Node):
             return
 
     def transform_to_matrix(self, transform: TransformStamped):
-        """Convert TransformStamped to 4x4 transformation matrix."""
+        """
+        Convert TransformStamped to 4x4 transformation matrix. Todo: move to utils
+        """
         translation = transform.transform.translation
         rotation = transform.transform.rotation
-        matrix = quaternion_matrix([rotation.x, rotation.y, rotation.z, rotation.w])
-        matrix[:3, 3] = [translation.x, translation.y, translation.z]
+        tx, ty, tz = translation.x, translation.y, translation.z
+        qx, qy, qz, qw = rotation.x, rotation.y, rotation.z, rotation.w
 
-        tf_matrix = o3c.Tensor(matrix, dtype=o3c.float32, device=self.o3d_device)  # todo: declare once then update here
+        if SCIPY_INSTALLED:
+            if int(SCIPY_VERSION.split('.')[1]) < 14:
+                self.rotation_object = R.from_quat([qx, qy, qz, qw])  # x, y, z, w
+            else:
+                # scalar_first = False -> x, y, z, w. True -> w, x, y, z
+                self.rotation_object = R.from_quat([qx, qy, qz, qw], scalar_first=False)
 
-        # self.camera_to_robot_tf = tf_matrix
-        return tf_matrix
+            self.homogenous_matrix[:3, :3] = self.rotation_object.as_matrix()
+            self.homogenous_matrix[:3, 3] = [tx, ty, tz]
 
-    def o3d_pcd_to_ros_pcd2(self, o3d_pcd, frame_id, stamp=None):
-        """Todo: remove. Convert Open3D point cloud to ROS PointCloud2 message."""
-        # Get points and colors from Open3D point cloud
-        points = o3d_pcd.point.positions.cpu().numpy()
-        colors = o3d_pcd.point.colors.cpu().numpy()
+        else:
+            self.homogenous_matrix = quaternion_matrix([qx, qy, qz, qw])
+            self.homogenous_matrix[:3, 3] = [tx, ty, tz]
 
-        if stamp is None:
-            stamp = self.get_clock().now().to_msg()
+        o3d_matrix = o3c.Tensor(self.homogenous_matrix, dtype=o3c.float32, device=self.o3d_device)  # todo: declare once then update here
 
-        # Create PointCloud2 message
-        header = Header()
-        header.stamp = stamp
-        header.frame_id = frame_id
-
-        msg = PointCloud2()
-        msg.header = header
-
-        # Define fields
-        msg.fields = [
-            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-            PointField(name='rgb', offset=12, datatype=PointField.FLOAT32, count=1),
-        ]
-
-        msg.height = 1
-        msg.width = len(points)
-        msg.is_bigendian = False
-        msg.point_step = 16
-        msg.row_step = msg.point_step * msg.width
-        msg.is_dense = True
-
-        # Combine XYZ and RGB into a structured array
-        cloud_data = np.zeros(len(points), dtype=[
-            ('x', np.float32),
-            ('y', np.float32),
-            ('z', np.float32),
-            ('rgb', np.float32)
-        ])
-
-        cloud_data['x'] = points[:, 0]
-        cloud_data['y'] = points[:, 1]
-        cloud_data['z'] = points[:, 2]
-
-        # Convert RGB colors from float [0,1] to uint8 [0,255] and pack into float32
-        rgb_colors = (colors * 255).astype(np.uint8)
-        rgb = rgb_colors.astype(np.uint32)
-        rgb = np.array((rgb[:, 0] << 16) | (rgb[:, 1] << 8) | (rgb[:, 2]))
-        cloud_data['rgb'] = rgb.view(np.float32)
-
-        msg.data = cloud_data.tobytes()
-
-        return msg
+        # self.camera_to_robot_tf = o3d_matrix
+        return o3d_matrix
 
     def tensor_to_ros_cloud(self, cloud_data, fields, header=None):
         """Convert Open3D tensor pointcloud to ROS PointCloud2 message"""
@@ -752,6 +769,7 @@ class PointcloudPreprocessorNode(Node):
         return point_cloud2.create_cloud(header, fields, cloud_data)
 
     def convert_to_open3d_tensor(self, input_array):
+        # todo: move to utils
         if isinstance(input_array, np.ndarray):
             # could also initialize as an Open3D tensor directly
             if 'cpu' in str(self.o3d_device).lower():
@@ -816,18 +834,24 @@ class PointcloudPreprocessorNode(Node):
         # Iterate over each parameter in this node
         for param in params:
             if param.name == f'{self.parameter_namespace}input_topic' and param.type_ == Parameter.Type.STRING:
-                # self.poincloud_sub.destroy()
-                self.destroy_subscription(self.poincloud_sub)
-                time.sleep(0.5)
+                if param.value == self.input_topic:
+                    continue
+                # # self.poincloud_sub.destroy()
+                # self.destroy_subscription(self.poincloud_sub)
+                # time.sleep(0.5)
                 self.input_topic = param.value
+                self.pointcloud_metadata.pop('has_intensity', None)
                 self.poincloud_sub = self.create_subscription(PointCloud2, self.input_topic,
                                                               self.callback, qos_profile=self.qos_profile)
 
             elif param.name == f'{self.parameter_namespace}output_topic' and param.type_ == Parameter.Type.STRING:
-                # self.pointcloud_pub.destroy()
-                self.destroy_publisher(self.pointcloud_pub)
-                time.sleep(0.5)
+                if param.value == self.output_topic:
+                    continue
+                # # self.pointcloud_pub.destroy()
+                # self.destroy_publisher(self.pointcloud_pub)
+                # time.sleep(0.5)
                 self.output_topic = param.value
+                self.pointcloud_metadata.pop('has_intensity', None)
                 self.pointcloud_pub = self.create_publisher(PointCloud2, self.output_topic, self.queue_size)
 
             elif param.name == f'{self.parameter_namespace}use_gpu' and param.type_ == Parameter.Type.BOOL:
@@ -861,15 +885,33 @@ class PointcloudPreprocessorNode(Node):
             elif param.name == f'{self.parameter_namespace}gpu_backend' and param.type_ == Parameter.Type.STRING:
                 self.gpu_backend = param.value
             elif param.name == f'{self.parameter_namespace}robot_frame' and param.type_ == Parameter.Type.STRING:
-                self.robot_frame = param.value
+                robot_frame = param.value
+                # if the robot frame is changed, recompute the transform
+                if robot_frame.lower() != self.robot_frame.lower():
+                    assert SCIPY_INSTALLED or TF_TRANSFORMATIONS_INSTALLED
+                    self.camera_to_robot_tf = None
+                    self.rotation_object = None
+                    self.homogenous_matrix = np.eye(4)
+
+                self.robot_frame = robot_frame
+
                 try:
-                    self.new_header_data['stamp_source'] = param.value
+                    self.new_header_data['stamp_source'] = robot_frame
                 except NameError:
                     pass
             elif param.name == f'{self.parameter_namespace}static_camera_to_robot_tf' and param.type_ == Parameter.Type.BOOL:
                 self.static_camera_to_robot_tf = param.value
             elif param.name == f'{self.parameter_namespace}transform_timeout' and param.type_ == Parameter.Type.DOUBLE:
                 self.transform_timeout = param.value
+            elif param.name == f'{self.parameter_namespace}offset_pointcloud_matrix' and param.type_ == Parameter.Type.DOUBLE:
+                self.offset_pointcloud_matrix = param.value
+                self.offset_pointcloud_matrix = np.array(self.offset_pointcloud_matrix).reshape(4, 4)
+                if np.allclose(self.offset_pointcloud_matrix, np.eye(4)):
+                    self.offset_pointcloud_matrix = None
+                else:
+                    self.offset_pointcloud_matrix = o3c.Tensor(self.offset_pointcloud_matrix, dtype=o3c.float32, device=self.o3d_device)
+            elif param.name == f'{self.parameter_namespace}offset_pointcloud_frame' and param.type_ == Parameter.Type.STRING:
+                self.offset_pointcloud_frame = param.value
             elif param.name == f'{self.parameter_namespace}organize_cloud' and param.type_ == Parameter.Type.BOOL:
                 self.organize_cloud = param.value
             elif param.name == f'{self.parameter_namespace}save_pointcloud' and param.type_ == Parameter.Type.BOOL:
@@ -960,6 +1002,10 @@ class PointcloudPreprocessorNode(Node):
                 result.successful = False
             self.get_logger().info(f"Success = {result.successful} for param {param.name} to value {param.value}")
         return result
+
+
+    def _reset_callback(self):
+        pass
 
     def pointcloud_saver(self, pcd_number):
         if self.save_pointcloud:
